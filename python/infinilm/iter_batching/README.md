@@ -34,7 +34,7 @@ Programmatic API: `infinilm.iter_batching.enable(**overrides)` / `disable()`.
 | `INFINILM_IB_MIXED_BATCH` | `1` | Mixed batching switch (relies on chunked prefill) |
 | `INFINILM_IB_MAX_BATCHED_TOKENS` | `8192` | Per-step token budget (chunk size cap) |
 | `INFINILM_IB_MIXED_STEP_TOKENS` | `0` | Prefill token cap within a mixed step; `0` = unlimited (default, best throughput / TTFT tail in measurements) |
-| `INFINILM_IB_PREFILL_PRIORITY` | `decode-first` | Mixed-batch budget policy |
+| `INFINILM_IB_PREFILL_PRIORITY` | `decode-first` | Mixed-batch budget policy: `decode-first` only (`prefill-first` is reserved but not implemented; handled per `INFINILM_IB_FALLBACK`) |
 | `INFINILM_IB_FALLBACK` | `warn` | Handling of unsupported configs: `warn` falls back / `error` refuses |
 
 ## Deployment prerequisite (important)

@@ -11,14 +11,15 @@ on the script side), and can also be overridden programmatically via
 | INFINILM_IB_MIXED_BATCH | 1 | Prefill+decode mixed batching (with chunked_prefill=0, whole prefill joins mixing) |
 | INFINILM_IB_MAX_BATCHED_TOKENS | 8192 | Per-step token budget (chunk size cap) |
 | INFINILM_IB_MIXED_STEP_TOKENS | 0 | Prefill token cap within a mixed step; 0 = unlimited (best throughput / TTFT tail in measurements) |
-| INFINILM_IB_PREFILL_PRIORITY | decode-first | Mixed-batch budget policy: decode-first / prefill-first |
+| INFINILM_IB_PREFILL_PRIORITY | decode-first | Mixed-batch budget policy: decode-first only (prefill-first is reserved but not implemented; handled per INFINILM_IB_FALLBACK) |
 | INFINILM_IB_FALLBACK | warn | Handling of unsupported configs: warn (fall back to original scheduling) / error |
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, replace
 
 _PREFILL_PRIORITIES = ("decode-first", "prefill-first")
 _FALLBACK_MODES = ("warn", "error")
@@ -49,6 +50,19 @@ class IBConfig:
                 f"INFINILM_IB_FALLBACK must be one of {_FALLBACK_MODES}, "
                 f"got {cfg.fallback!r}"
             )
+        if cfg.prefill_priority == "prefill-first":
+            # The value is reserved, but only decode-maximal ordering is
+            # implemented. Never keep (and report) an effective policy that is
+            # not actually executed: refuse or fall back explicitly.
+            msg = (
+                "iter_batching: INFINILM_IB_PREFILL_PRIORITY=prefill-first is "
+                "reserved but not implemented (the scheduler only supports "
+                "decode-maximal ordering)."
+            )
+            if cfg.fallback == "error":
+                raise ValueError(msg + " Refusing to start per fallback=error.")
+            warnings.warn(msg + " Falling back to decode-first.")
+            cfg = replace(cfg, prefill_priority="decode-first")
         if cfg.max_batched_tokens < 256:
             raise ValueError(
                 f"INFINILM_IB_MAX_BATCHED_TOKENS must be >= 256, "
@@ -65,8 +79,6 @@ class IBConfig:
                 f"got {cfg.mixed_step_tokens}"
             )
         if cfg.mixed_batch and not cfg.chunked_prefill:
-            import warnings
-
             warnings.warn(
                 "iter_batching: MIXED_BATCH=1 with CHUNKED_PREFILL=0 schedules "
                 "whole prefill segments inside mixed steps (long prompts inflate "
