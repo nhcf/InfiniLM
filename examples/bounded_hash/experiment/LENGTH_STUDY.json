@@ -1,0 +1,25 @@
+{
+  "study": "reuse8-matched-lengths-v1",
+  "source_checkpoint": "selection_20261103T023718_124257Z/phase_checkpoint",
+  "archive_library_id": "libfile_60dccb17c9bc8191921a35bf061f04ca",
+  "groups_per_panel": 18,
+  "seed": 33962,
+  "rounds": 1,
+  "default_concurrency": 16,
+  "optional_separate_concurrency": 32,
+  "learning_requests_per_cell": 64,
+  "measured_requests_per_cell": 128,
+  "primary_metric": "output tokens per phase wall second",
+  "throughput_wins": {
+    "strict_numeric": ">0%",
+    "practical_margin": ">=2%"
+  },
+  "cpu_tests_passed": 213,
+  "archived_requests_rechecked_with_new_metrics": 1728,
+  "unchanged_proven_code_files": 56,
+  "python310_grammar": "PASS",
+  "source_anchor_assets": 8,
+  "real_Qwen_tokenizer_on_this_host": false,
+  "real_Qwen_tokenizer_on_server": "checked before calibration or measured model pools",
+  "new_GPU_benchmarks_executed_here": 0
+}

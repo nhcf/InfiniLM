@@ -1,0 +1,208 @@
+{
+  "config": {
+    "repo": "/mnt/zj-data/data/chengcp/infinilm/InfiniLM",
+    "model": "/mnt/zj-data/models/Qwen3-32B/",
+    "nh_python": "/usr/bin/python3",
+    "vllm_python": "/usr/bin/python3",
+    "native_dir": "/mnt/zj-data/data/chengcp/infinilm/runtime/native",
+    "core_python": "/mnt/zj-data/data/chengcp/infinilm/runtime/core_python",
+    "core_root": "/root/.infini-mate",
+    "device": "moore",
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "port": 18880,
+    "startup_timeout_s": 1800,
+    "cpu_threads": 4,
+    "nh_blocks": 128,
+    "nh_block_size": 256,
+    "max_batch": 3,
+    "token_budget": 8192,
+    "prompt_tokens": 8192,
+    "output_tokens": 512,
+    "max_context": 9216,
+    "vllm_block_size": 16,
+    "vllm_gpu_blocks": 2048,
+    "vllm_memory": 0.92,
+    "skew": 1.25,
+    "gap": 0,
+    "shadow_capacity_fraction": 0.7,
+    "nh_env": {},
+    "vllm_env": {},
+    "common_env": {},
+    "admission_cap": 3,
+    "cache_ttl_s": 5.0,
+    "queue_timeout_s": 600.0
+  },
+  "nh_git": {
+    "head": "8657a943553e2c67ad5f3db3db32931d8c97c3ae",
+    "origin": "https://github.com/nhcf/InfiniLM.git"
+  },
+  "nh_files": {
+    "python/infinilm/llm/scheduler.py": "1f6fafc8d01631cdc6ba65ec95ccc1678c0fb61197cbeb6e80768ea334d8cbd0",
+    "python/infinilm/llm/cache_manager.py": "d7792e9118683a9c5476158d14849dee8390c9b2dbfdf095cfcaca4051356987",
+    "python/infinilm/server/inference_server.py": "f688722a9a7b9e47eded6ac3709b79ccbac055676e5217b287a76ba17e9103a0",
+    "python/infinilm/llm/llm.py": "fd3e0ba75f2296e315a5a468e2ec67a6db9f80e154f32d0c1a89ba75a3d94d64"
+  },
+  "native_bindings": {
+    "/mnt/zj-data/data/chengcp/infinilm/runtime/native/_infinilm.cpython-310-x86_64-linux-gnu.so": "aaac545e33b662434bb2cdae6447a97accd2348f28caaf827cec65c07048068c",
+    "/mnt/zj-data/data/chengcp/infinilm/runtime/core_python/infinicore/lib/_infinicore.cpython-310-x86_64-linux-gnu.so": "43e7409afb4b6cfedd49ef50f216f50f9901280d09947bc10b2d225ebb0893ca"
+  },
+  "tokenizer_files": {
+    "config.json": "97e295b63283935788fac5e4f8860862a56d4089538cafc93f0431f2ebe483bb",
+    "generation_config.json": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+    "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+  },
+  "package_versions": {
+    "nh": {
+      "aiohttp": "3.13.3",
+      "infinilm": "0.1.0",
+      "torch": "2.7.1",
+      "torch-musa": "2.7.1",
+      "transformers": "4.56.1",
+      "vllm": "0.20.1.dev0+g88d34c640.d20260508.empty",
+      "vllm-musa": "0.1.1"
+    },
+    "vllm": {
+      "aiohttp": "3.13.3",
+      "infinilm": "0.1.0",
+      "torch": "2.7.1",
+      "torch-musa": "2.7.1",
+      "transformers": "4.56.1",
+      "vllm": "0.20.1.dev0+g88d34c640.d20260508.empty",
+      "vllm-musa": "0.1.1"
+    }
+  },
+  "hardware": {
+    "available": true,
+    "cuda_runtime": null,
+    "device": "moore",
+    "devices": [
+      {
+        "major": 3,
+        "minor": 1,
+        "multi_processor_count": 60,
+        "name": "MTT S5000",
+        "total_memory": 85813358592
+      },
+      {
+        "major": 3,
+        "minor": 1,
+        "multi_processor_count": 60,
+        "name": "MTT S5000",
+        "total_memory": 85813358592
+      },
+      {
+        "major": 3,
+        "minor": 1,
+        "multi_processor_count": 60,
+        "name": "MTT S5000",
+        "total_memory": 85813358592
+      },
+      {
+        "major": 3,
+        "minor": 1,
+        "multi_processor_count": 60,
+        "name": "MTT S5000",
+        "total_memory": 85813358592
+      },
+      {
+        "major": 3,
+        "minor": 1,
+        "multi_processor_count": 60,
+        "name": "MTT S5000",
+        "total_memory": 85813358592
+      },
+      {
+        "major": 3,
+        "minor": 1,
+        "multi_processor_count": 60,
+        "name": "MTT S5000",
+        "total_memory": 85813358592
+      },
+      {
+        "major": 3,
+        "minor": 1,
+        "multi_processor_count": 60,
+        "name": "MTT S5000",
+        "total_memory": 85813358592
+      },
+      {
+        "major": 3,
+        "minor": 1,
+        "multi_processor_count": 60,
+        "name": "MTT S5000",
+        "total_memory": 85813358592
+      }
+    ],
+    "torch_version": "2.7.1"
+  },
+  "verified_source_run": "cache_confirm_run_20261028T081428_439145Z",
+  "scope": "Known-working MUSA execution environment; original route sources separately frozen in pre-run plan. Model weight shards are not hashed.",
+  "proven_sources": {
+    "admission_telemetry.py": "6f3fd261ab92e55bbe5ebbbcd10486a9f494c09b7d4e8aaf1991f1723dbd8198",
+    "affinity_router.py": "be5c418729e1beca7fc41e367b7175fecd79edb3a7a3ef0e82d5412b7c29c1a9",
+    "backend_runtime.py": "f34f6a815ad2bba0e16ca19a705b78a8af5fba88d973ed7b97c7d9aa923d0f55",
+    "cache_calibration.py": "93bf44972b045b28e94364acae744a3bde678962920e9b6e973478172416e058",
+    "cache_confirm.py": "ad3baa4ec761cc1f7b69a1099eadab6a64ed0cc8dfa8240bdf512beb20f05c06",
+    "cache_policy.py": "482d11810561d6e935926d9539d6001eee061419863d1f6c2a6cb509ba2813ea",
+    "cache_router.py": "26a33f5a0377f72e067627cae7b002702eb42a16006d7ae111687d8d245aedfb",
+    "cache_suite.py": "48c39a240a7035507f498019f4e3998f4026afb10164906da5cdbc234878ae96",
+    "cache_workload.py": "7484982d1e1f3322d9e02ca21c20700b5eab881c938fe58a9c4e361e6efada74",
+    "cost_router.py": "b946a574a6d31b9f0ebceb0387f375be41c454f4548282db1f216d5226397e60",
+    "diagnose_confirmation.py": "5178ae0592fd9aa0381fff201882eee03c25d68f542c0349e51c365c1e2bc93e",
+    "gateway.py": "bd33e67fb8465a691276ee1547f5d5ec9ad7de2dac081cf2054c37c5f4c10542",
+    "harness.py": "cb46591011e54227400783c6578517f7179d3cb655753658c9cc707b47689c26",
+    "matrix.py": "02be758117c668ab9b33baf8f0f64d443b27f4992f1bfa79269fdb5289028dee",
+    "mean_router.py": "e5369dc7c70ac41968deabff796e6845fc255be359d2f46519f368930dfa2a3c",
+    "mean_suite.py": "d2f61bd0163b1cbb7d11983e846a05a300f30a5f3cfdcbdf4f71b8a86e7d23d9",
+    "mean_workload.py": "2ae32b937b352c9a97923fb81f4f63d526a0d351067c2bb3548640cea9874f7c",
+    "next_step.py": "9503b89e69b3cef064ccee7b86331827947833ab3cda5d3d50f2f4d18b577a86",
+    "nh_stream_usage.py": "83761ebe1df0181e43baab3f5c9ccb030dc817f5426ffa8877fd2a3ae33355fd",
+    "phase_calibration.py": "97fa9e546540e69d63cc04de5c4ab4a105df6ca3880b3983c9b2c0cc8ae61a31",
+    "phase_router.py": "848c07ca4c7fe7813de6e476fce5aa66dd74de85836c9b430641c1b32ef54b62",
+    "phase_suite.py": "4ee5d2d4c28ddf0f8b4bbc7461f3469689c116ada59cfc5ed7f9f401340908d4",
+    "phase_workload.py": "3abf15c7b3805727c914375aca908a2f24d8905a1e2773fbdf1c4805b626d4b5",
+    "run_cache.sh": "a91b85dc7bad25933815e3bb16608edb39c83210a0f67e9089d84819480e4f39",
+    "run_fix.sh": "18c5abe429b49c886deecb25af5b4605b3199539d088d5a22d34e752d76df39a",
+    "run_matrix.sh": "099af776f1f1011e11eba54fade5430067960452a0d44e1738cc4fe12e60e5b5",
+    "run_mean.sh": "c3230d03c65d87c5e7f497c2f692f06efa8e119c46ce9b23c025d59d367c734d",
+    "run_next.sh": "52ab7625564d37bfcbb734151a0946aaa07efba8c153cafb556c8013f3b1531d",
+    "run_phase.sh": "f5cedb8e08c8bb882289f04ffb34fc1fec624236dbeeb921098002f0c445018b",
+    "stable_router.py": "496e32a68129a768dff18ff6984ebb5cb01fd70d45585ba01fa1ef46fbf9a380",
+    "streaming.py": "28d5c1ba5194b18559d07c6384edd61225468b35682bb1bfd754cf46a5d98bab",
+    "summarize_cache.py": "98bc1d639c4154ce747b2b9554d714ed22fcee28a75358b467bdc75c8e059aa4",
+    "summarize_confirmation.py": "70b688560b70ae4c9d9d3251e5fb9513486d8a0789a4de79f03c4ff2960492ad",
+    "test_admission_telemetry.py": "9adc1762f0d27f98907edfb6c424cf9ba838614591ffea0bf5344004714c8606",
+    "test_affinity_router.py": "1eaa15a2d470182c2d4a19d2e98996ded8d75c42e7ab29cdeadb2ead910e01e6",
+    "test_cache_router_v2.py": "029f244f89964bf1fe5c7fe0a1ff1f2248c9b75e8c2b2529f7388821c0fe23a7",
+    "test_cache_suite_v2.py": "aab3658df65e3cab9d937f2a0f0efe1ce47120cfd854c22276498c2396012405",
+    "test_cache_telemetry.py": "1c0c488e48271e4231043128319a1183938496f608ba612007ef05c346d5e58e",
+    "test_cohort_failure_report.py": "dc65463c4dc767581929cd6715da3f26ef5b201ed0f0cb56c33b6ea0a39286e2",
+    "test_confirmation_runner.py": "16b704dc8eb592b7340680d8d792065a0016ad4d0c3b3b0fce8a0dfd8410f7a1",
+    "test_diagnose_confirmation.py": "db26743a217dff5541be0586342e95887722d633d3a1ef8e9eb34e791edbe2b4",
+    "test_gateway_integration.py": "bd812f6282b3cc57fc21317a0afa9aee958c71401fc462efff7f8da2087a8913",
+    "test_gateway_transport.py": "136fe7598bdac14c546c14cb07ce837e323fe5fc2ee61362513489b03f4d6779",
+    "test_matrix.py": "06d9293e1474c6703bb102b41a6c530dca0afbb30f7a2d76f318213b45a52d3f",
+    "test_mean_router.py": "ef54dc5deb058ee29ef08ba63c3e919badbbfa4a0bffe748d239a5e7f113ace8",
+    "test_mean_suite.py": "1ed85084829e3159d5806920d1cf0f6e04347e9ee01eb5f05880e7f85417d1ec",
+    "test_next_stage_integration.py": "10332c162bbba9c8e498e822d8c9bce0449bba602d86b17586bc12b8d1abd795",
+    "test_next_step.py": "9c7523e5c495285d0ac01e1d7bfffb6ee0fb0e951cd850c5dd1e95a32a6bc932",
+    "test_phase_router.py": "c15ea90959155a9b9205478297fef3d613cc8ff2f724482263aca950425b7f42",
+    "test_phase_suite.py": "caa9e38330d9e5f99f946152c60d58422bdaa8203a79936911feb1b717df8f5c",
+    "test_summarize_confirmation.py": "be5a734b4163bf192a35472c1cbc71273ecb3f109f4607de01b4d13119c94391",
+    "vendor/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "vendor/nhcf_cache/cache_manager.py": "d7792e9118683a9c5476158d14849dee8390c9b2dbfdf095cfcaca4051356987",
+    "vendor/nhcf_cache/prefix_cache.py": "584367fd1d5a46932a5a9a96247091664071ec4e1d1fa21749a49fc23f248fa1",
+    "vendor/routing_manager.py": "ec65247a78c01272bef9c4d51ebdc2bc0b6a1e1383a53d61e1ba5b5c0de56118",
+    "workload.py": "d4dee4b9b68835b62655325cb3d8b3b4d9b4802ee328bd743889220643ddffa5"
+  }
+}

@@ -1,0 +1,5 @@
+# Frozen experiment files must retain their exact byte representation.
+experiment/** -text
+# Preserve the two historical trailing blank lines without changing source hashes.
+experiment/backend_runtime.py whitespace=-blank-at-eof
+experiment/cost_router.py whitespace=-blank-at-eof

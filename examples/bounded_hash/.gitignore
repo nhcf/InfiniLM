@@ -1,0 +1,34 @@
+# Curated source assets override the parent repository blanket patterns.
+!/SOURCE_MANIFEST.json
+!/experiment/LENGTH_STUDY.json
+!/experiment/SHA256SUMS.txt
+!/experiment/VALIDATION.json
+!/experiment/anchor_data/original_case.json
+!/experiment/anchor_data/reuse8_seed33962/smoke.json
+!/experiment/anchor_data/source_hashes.json
+!/experiment/baseline_sources.json
+!/experiment/config.musa.example.json
+!/experiment/config.musa.json
+!/experiment/config32b.json
+!/experiment/reference_environment.json
+!/experiment/run_cache.sh
+!/experiment/run_fix.sh
+!/experiment/run_lengths.sh
+!/experiment/run_matrix.sh
+!/experiment/run_mean.sh
+!/experiment/run_next.sh
+!/experiment/run_optimized.sh
+!/experiment/run_phase.sh
+!/experiment/run_select.sh
+!/requirements-cpu.txt
+!/PACKAGING_VALIDATION.json
+
+# Generated files stay local.
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+/experiment/results*/
+/experiment/*.pid
+/experiment/*.lock
+/experiment/report_error.json

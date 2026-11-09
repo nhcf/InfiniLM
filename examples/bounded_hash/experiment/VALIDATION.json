@@ -1,0 +1,37 @@
+{
+  "status": "CPU_VALIDATION_PASS",
+  "date": "2026-11-04",
+  "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+  "cpu_tests": 262,
+  "cpu_test_command": "python3 -B -m unittest discover -q -b",
+  "cpu_test_duration_s": 8.395,
+  "python310_grammar_files": 69,
+  "unchanged_successful_source_files": 70,
+  "historical_v2_vllm_request_records_audited": 2304,
+  "local_http_sse_integration_tests": 2,
+  "model_loads_in_this_workspace": 0,
+  "gpu_benchmarks_in_this_workspace": 0,
+  "gpu_performance_result": "NOT_RUN",
+  "real_qwen_tokenizer_in_this_workspace": "NOT_AVAILABLE; server validates before calibration",
+  "favorable_panel": {
+    "input_tokens": 8192,
+    "shared_tokens": 7936,
+    "output_tokens": [
+      32,
+      64,
+      128
+    ],
+    "documents": 8,
+    "hot_fraction": 0.25,
+    "concurrency": 16,
+    "seed": 33962,
+    "rounds": 1,
+    "arms": [
+      "nh_cache_bounded_v3",
+      "nh_cache_bounded_v2",
+      "vllm_least_active"
+    ],
+    "cells": 9,
+    "learning_and_measured_requests": 1728
+  }
+}

@@ -1,0 +1,3 @@
+# CPU regression dependencies only; not a MUSA/GPU installation recipe.
+aiohttp
+numpy

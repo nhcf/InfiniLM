@@ -1,0 +1,22 @@
+{
+  "profile": "reuse8",
+  "seed": 33962,
+  "folder": "reuse8_seed33962",
+  "prompt_tokens": 8192,
+  "shared_tokens": 7936,
+  "output_tokens": 32,
+  "documents": 8,
+  "hot_fraction": 0.25,
+  "files": {
+    "learn": {
+      "count": 64,
+      "sha256": "cb18c451320bae23d301b4baecdd8e1041df4a01fe6f1ceef8d848657567c7ba"
+    },
+    "measured": {
+      "count": 128,
+      "sha256": "e579aa2d97f1323627a0d8a2091970f07afb812d754cb730d35a557767d087ea"
+    }
+  },
+  "unique_full_inputs": 192,
+  "cold_distinct_documents": false
+}
