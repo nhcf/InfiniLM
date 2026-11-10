@@ -121,6 +121,27 @@ class BaseConfig:
         # PD separation (KV transfer)
         self.kv_transfer_config = self.args.kv_transfer_config
 
+        # SLA-constrained dynamic batching (paper Algorithm 1 + 2)
+        self.enable_sla_constraint = self.args.enable_sla_constraint
+        self.sla_latency = self.args.sla_latency
+        self.sla_epsilon = self.args.sla_epsilon
+        self.batch_size_lower = self.args.batch_size_lower
+        self.batch_size_upper = self.args.batch_size_upper
+        self.sla_alpha = self.args.sla_alpha
+        self.sla_sigma = self.args.sla_sigma
+        self.sla_history_window = self.args.sla_history_window
+        self.sla_queue_refill = self.args.sla_queue_refill
+        self.sla_mem_bound_floor = self.args.sla_mem_bound_floor
+        self.sla_mem_bound_accurate = self.args.sla_mem_bound_accurate
+        self.sla_admission_fallback = self.args.sla_admission_fallback
+        self.max_prefill_starvation_steps = self.args.max_prefill_starvation_steps
+        self.enable_sla_prefill_ctrl = self.args.enable_sla_prefill_ctrl
+        self.sla_prefill_budget_s = self.args.sla_prefill_budget
+        self.sla_prefill_chunk_min = self.args.sla_prefill_chunk_min
+        self.enable_memory_aware_batching = self.args.enable_memory_aware_batching
+        self.memory_usage_factor = self.args.memory_usage_factor
+        self.enable_batch_stats = self.args.enable_batch_stats
+
         # Multimodal parameters
         self.image = self.args.image
         self.video = self.args.video
@@ -450,6 +471,140 @@ class BaseConfig:
             ),
         )
 
+        # ---- SLA-constrained dynamic batching (paper Algorithm 1 + 2) ----
+        sla = self.parser.add_argument_group("SLA-constrained dynamic batching")
+        sla.add_argument(
+            "--enable-sla-constraint",
+            action="store_true",
+            help="enable SLA-constrained dynamic batching (paper Algorithm 2); "
+            "paged attention only",
+        )
+        sla.add_argument(
+            "--sla-latency",
+            type=float,
+            default=0.05,
+            help="decode TBT SLA target D_SLA in seconds (default: 0.05)",
+        )
+        sla.add_argument(
+            "--sla-epsilon",
+            type=float,
+            default=0.005,
+            help="tolerance band around D_SLA (default: 0.005)",
+        )
+        sla.add_argument(
+            "--batch-size-lower",
+            type=int,
+            default=1,
+            help="lower bound B_min of the dynamic batch search range (default: 1)",
+        )
+        sla.add_argument(
+            "--batch-size-upper",
+            type=int,
+            default=0,
+            help="upper bound B_max; 0 = follow --max-batch-size "
+            "(must not exceed --max-batch-size)",
+        )
+        sla.add_argument(
+            "--sla-alpha",
+            type=int,
+            default=8,
+            help="minimum gap alpha kept between the temporary bounds (default: 8)",
+        )
+        sla.add_argument(
+            "--sla-sigma",
+            type=int,
+            default=1,
+            help="correction step sigma applied to the bounds (default: 1)",
+        )
+        sla.add_argument(
+            "--sla-history-window",
+            type=int,
+            default=100,
+            help="number of recent decode steps used for the running statistics "
+            "(default: 100)",
+        )
+        sla.add_argument(
+            "--sla-queue-refill",
+            action="store_true",
+            help="raise the lower bound of the batch search range to "
+            "(running + waiting) while latency is inside the SLA band, so a "
+            "burst backlog cannot pin the cap to the running count and starve "
+            "prefill admission (default off: behaviour unchanged)",
+        )
+        sla.add_argument(
+            "--sla-mem-bound-floor",
+            action="store_true",
+            help="never let the memory-aware bound (Algorithm 1) push the cap "
+            "below B_min; prevents cap==num_running from closing admission "
+            "when few requests run but prefix-cache blocks are held "
+            "(default off: behaviour unchanged)",
+        )
+        sla.add_argument(
+            "--sla-mem-bound-accurate",
+            action="store_true",
+            help="estimate blocks_per_seq for the memory-aware bound from what the "
+            "running requests actually hold, instead of (pool-used / running), "
+            "which counts blocks reserved by waiting requests and prefix-cache "
+            "blocks and collapses the bound (default off: behaviour unchanged)",
+        )
+        sla.add_argument(
+            "--sla-admission-fallback",
+            action="store_true",
+            help="give per-step prefill admission a fallback based on the pool's "
+            "free blocks, so a cap pushed down to the running count cannot make "
+            "admission exactly 0 while the pool still has room "
+            "(default off: behaviour unchanged)",
+        )
+        sla.add_argument(
+            "--max-prefill-starvation-steps",
+            type=int,
+            default=0,
+            help="tier-1 probe: force one decode step after N consecutive "
+            "prefill-only steps (0 = disabled; scheduling behaviour is then "
+            "identical to runs without this flag)",
+        )
+        sla.add_argument(
+            "--enable-sla-prefill-ctrl",
+            action="store_true",
+            help="SLA channel 2: adapt the per-step prefill token budget from "
+            "the online prefill-rate estimate (chunk = sla_prefill_budget_s x "
+            "rate, clamped to [sla_prefill_chunk_min, max_num_batched_tokens]). "
+            "If --max-prefill-starvation-steps is left at 0 it is auto-set to "
+            "4 (chunking alone does not bound decode starvation). "
+            "Default off: behaviour is bit-identical to runs without this flag",
+        )
+        sla.add_argument(
+            "--sla-prefill-budget",
+            type=float,
+            default=4.0,
+            help="target seconds per prefill step for --enable-sla-prefill-ctrl "
+            "(default: 4.0)",
+        )
+        sla.add_argument(
+            "--sla-prefill-chunk-min",
+            type=int,
+            default=1024,
+            help="lower bound of the adaptive prefill chunk in tokens "
+            "(default: 1024)",
+        )
+        sla.add_argument(
+            "--enable-memory-aware-batching",
+            action="store_true",
+            help="enable the memory-aware batch bound b_mem (paper Algorithm 1)",
+        )
+        sla.add_argument(
+            "--enable-batch-stats",
+            action="store_true",
+            help="(measurement only) record decode step latency / batch size in "
+            "/dynamic_batch_stats even when the control loop is disabled",
+        )
+        sla.add_argument(
+            "--memory-usage-factor",
+            type=float,
+            default=0.95,
+            help="fraction of KV blocks the memory bound may use (default: 0.95)",
+        )
+
     def _torch_device_available(self, device_type):
         module_name = {
             "cuda": None,
@@ -519,6 +674,7 @@ class BaseConfig:
             ("cambricon", ["cnmon"]),
             ("ascend", ["npu-smi"]),
             ("moore", ["mthreads-gmi"]),
+            ("kunlun", ["xpu-smi"]),
             ("metax", ["mx-smi", "ht-smi"]),
             ("hygon", ["hy-smi"]),
             ("iluvatar", ["ixsmi"]),

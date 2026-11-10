@@ -125,6 +125,25 @@ class InferenceServer:
         kv_transfer_config: Optional[KVTransferConfig] = None,
         enable_prefix_caching: bool = True,
         pre_transpose: bool = False,
+        enable_sla_constraint: bool = False,
+        sla_latency: float = 0.05,
+        sla_epsilon: float = 0.005,
+        batch_size_lower: int = 1,
+        batch_size_upper: int = 0,
+        sla_alpha: int = 8,
+        sla_sigma: int = 1,
+        sla_history_window: int = 100,
+        sla_queue_refill: bool = False,
+        sla_mem_bound_floor: bool = False,
+        sla_mem_bound_accurate: bool = False,
+        sla_admission_fallback: bool = False,
+        max_prefill_starvation_steps: int = 0,
+        enable_sla_prefill_ctrl: bool = False,
+        sla_prefill_budget_s: float = 4.0,
+        sla_prefill_chunk_min: int = 1024,
+        enable_memory_aware_batching: bool = False,
+        memory_usage_factor: float = 0.95,
+        enable_batch_stats: bool = False,
     ):
         """Initialize inference server.
 
@@ -186,6 +205,25 @@ class InferenceServer:
         self.kv_transfer_config = kv_transfer_config
         self.enable_prefix_caching = enable_prefix_caching
         self.pre_transpose = pre_transpose
+        self.enable_sla_constraint = enable_sla_constraint
+        self.sla_latency = sla_latency
+        self.sla_epsilon = sla_epsilon
+        self.batch_size_lower = batch_size_lower
+        self.batch_size_upper = batch_size_upper
+        self.sla_alpha = sla_alpha
+        self.sla_sigma = sla_sigma
+        self.sla_history_window = sla_history_window
+        self.sla_queue_refill = sla_queue_refill
+        self.sla_mem_bound_floor = sla_mem_bound_floor
+        self.sla_mem_bound_accurate = sla_mem_bound_accurate
+        self.sla_admission_fallback = sla_admission_fallback
+        self.max_prefill_starvation_steps = max_prefill_starvation_steps
+        self.enable_sla_prefill_ctrl = enable_sla_prefill_ctrl
+        self.sla_prefill_budget_s = sla_prefill_budget_s
+        self.sla_prefill_chunk_min = sla_prefill_chunk_min
+        self.enable_memory_aware_batching = enable_memory_aware_batching
+        self.memory_usage_factor = memory_usage_factor
+        self.enable_batch_stats = enable_batch_stats
 
         self.engine: AsyncLLMEngine = None
 
@@ -229,6 +267,25 @@ class InferenceServer:
                 kv_transfer_config=self.kv_transfer_config,
                 enable_prefix_caching=self.enable_prefix_caching,
                 pre_transpose=self.pre_transpose,
+                enable_sla_constraint=self.enable_sla_constraint,
+                sla_latency=self.sla_latency,
+                sla_epsilon=self.sla_epsilon,
+                batch_size_lower=self.batch_size_lower,
+                batch_size_upper=self.batch_size_upper,
+                sla_alpha=self.sla_alpha,
+                sla_sigma=self.sla_sigma,
+                sla_history_window=self.sla_history_window,
+                sla_queue_refill=self.sla_queue_refill,
+                sla_mem_bound_floor=self.sla_mem_bound_floor,
+                sla_mem_bound_accurate=self.sla_mem_bound_accurate,
+                sla_admission_fallback=self.sla_admission_fallback,
+                max_prefill_starvation_steps=self.max_prefill_starvation_steps,
+                enable_sla_prefill_ctrl=self.enable_sla_prefill_ctrl,
+                sla_prefill_budget_s=self.sla_prefill_budget_s,
+                sla_prefill_chunk_min=self.sla_prefill_chunk_min,
+                enable_memory_aware_batching=self.enable_memory_aware_batching,
+                memory_usage_factor=self.memory_usage_factor,
+                enable_batch_stats=self.enable_batch_stats,
             )
             self.engine.start()
             logger.info(f"Engine initialized with model at {self.model_path}")
@@ -290,6 +347,23 @@ class InferenceServer:
             ):
                 return JSONResponse(content={"status": "unhealthy"}, status_code=503)
             return {"status": "healthy"}
+
+        @app.get("/dynamic_batch_stats")
+        async def dynamic_batch_stats():
+            """Debug endpoint: live SLA / dynamic-batching state (cap, bounds,
+            recent decode stats) so a harness can verify the loop is active."""
+            if self.engine is None:
+                return JSONResponse(
+                    content={"error": "engine not ready"}, status_code=503
+                )
+            stats = self.engine.engine.get_dynamic_batch_stats()
+            if stats is None:
+                return {
+                    "enable_sla_constraint": False,
+                    "enable_memory_aware_batching": False,
+                    "note": "dynamic batching unsupported by this cache type",
+                }
+            return stats
 
         def _models_payload():
             return {
@@ -648,6 +722,25 @@ def main():
         kv_transfer_config=kv_transfer_config,
         enable_prefix_caching=cfg.enable_prefix_caching,
         pre_transpose=cfg.pre_transpose,
+        enable_sla_constraint=cfg.enable_sla_constraint,
+        sla_latency=cfg.sla_latency,
+        sla_epsilon=cfg.sla_epsilon,
+        batch_size_lower=cfg.batch_size_lower,
+        batch_size_upper=cfg.batch_size_upper,
+        sla_alpha=cfg.sla_alpha,
+        sla_sigma=cfg.sla_sigma,
+        sla_history_window=cfg.sla_history_window,
+        sla_queue_refill=cfg.sla_queue_refill,
+        sla_mem_bound_floor=cfg.sla_mem_bound_floor,
+        sla_mem_bound_accurate=cfg.sla_mem_bound_accurate,
+        sla_admission_fallback=cfg.sla_admission_fallback,
+        max_prefill_starvation_steps=cfg.max_prefill_starvation_steps,
+        enable_sla_prefill_ctrl=cfg.enable_sla_prefill_ctrl,
+        sla_prefill_budget_s=cfg.sla_prefill_budget_s,
+        sla_prefill_chunk_min=cfg.sla_prefill_chunk_min,
+        enable_memory_aware_batching=cfg.enable_memory_aware_batching,
+        memory_usage_factor=cfg.memory_usage_factor,
+        enable_batch_stats=cfg.enable_batch_stats,
     )
     server.start()
 

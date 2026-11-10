@@ -163,10 +163,18 @@ class LLMEngine:
             )
             num_mamba_cache_blocks = max(2, config.num_blocks // 4)
 
-            max_num_batched_tokens = int(
-                os.getenv("INFINILM_MAX_NUM_BATCHED_TOKENS", max_position_embeddings)
+            # NOTE: an empty/whitespace INFINILM_MAX_NUM_BATCHED_TOKENS means
+            # "unset" (launch scripts can pass an unset optional variable
+            # through as an empty string); the old int("") crashed at startup.
+            raw_max_batched_tokens = os.getenv(
+                "INFINILM_MAX_NUM_BATCHED_TOKENS", ""
+            ).strip()
+            max_num_batched_tokens = (
+                int(raw_max_batched_tokens)
+                if raw_max_batched_tokens
+                else int(max_position_embeddings)
             )
-            assert 1024 <= max_num_batched_tokens <= max_position_embeddings
+            assert 1024 <= max_num_batched_tokens <= int(max_position_embeddings)
 
             self.scheduler = Scheduler(
                 max_batch_size=config.max_batch_size,
@@ -182,10 +190,45 @@ class LLMEngine:
                     if model_engine.model_type == "videonsa"
                     else None
                 ),
+                enable_sla_constraint=config.enable_sla_constraint,
+                sla_latency=config.sla_latency,
+                sla_epsilon=config.sla_epsilon,
+                batch_size_lower=config.batch_size_lower,
+                batch_size_upper=config.batch_size_upper,
+                sla_alpha=config.sla_alpha,
+                sla_sigma=config.sla_sigma,
+                sla_history_window=config.sla_history_window,
+                sla_queue_refill=config.sla_queue_refill,
+                sla_mem_bound_floor=config.sla_mem_bound_floor,
+                sla_mem_bound_accurate=config.sla_mem_bound_accurate,
+                sla_admission_fallback=config.sla_admission_fallback,
+                max_prefill_starvation_steps=config.max_prefill_starvation_steps,
+                enable_memory_aware_batching=config.enable_memory_aware_batching,
+                memory_usage_factor=config.memory_usage_factor,
+                enable_batch_stats=config.enable_batch_stats,
+                enable_sla_prefill_ctrl=config.enable_sla_prefill_ctrl,
+                sla_prefill_budget_s=config.sla_prefill_budget_s,
+                sla_prefill_chunk_min=config.sla_prefill_chunk_min,
             )
             if model_engine.model_type == "videonsa":
                 self.model_runner.bind_nsa_scheduler(self.scheduler)
             logger.info(f"Using Paged KV Cache with num_blocks={config.num_blocks}")
+            if config.enable_sla_constraint or config.enable_memory_aware_batching:
+                logger.info(
+                    "Dynamic batching enabled: sla=%s (D_SLA=%.4fs eps=%.4fs) "
+                    "mem_aware=%s (factor=%.2f) B=[%s, %s] alpha=%s sigma=%s "
+                    "window=%s",
+                    config.enable_sla_constraint,
+                    config.sla_latency,
+                    config.sla_epsilon,
+                    config.enable_memory_aware_batching,
+                    config.memory_usage_factor,
+                    config.batch_size_lower,
+                    config.batch_size_upper or config.max_batch_size,
+                    config.sla_alpha,
+                    config.sla_sigma,
+                    config.sla_history_window,
+                )
             if has_mamba_cache:
                 logger.info(
                     "Using Mamba cache with num_blocks=%s, zero_state_index=0",
@@ -220,6 +263,13 @@ class LLMEngine:
         if not self._async_abort_owner:
             _finalize_aborted_request(req, FinishReason.CANCELED)
 
+    def get_dynamic_batch_stats(self) -> Optional[dict]:
+        """Return the scheduler's dynamic-batching state, or None if unsupported."""
+        getter = getattr(self.scheduler, "get_dynamic_batch_stats", None)
+        if getter is None:
+            return None
+        return getter()
+
     def step(self) -> bool:
         """Run one inference step.
 
@@ -248,7 +298,28 @@ class LLMEngine:
             or scheduler_output.num_requests != len(requests)
         ):
             raise RuntimeError("scheduled batch has conflicting request identity")
+        t_step_start = time.perf_counter()
         runner_output = self.model_runner.execute_model(scheduler_output)
+        step_elapsed = time.perf_counter() - t_step_start
+
+        # Feed the SLA control loop (paper Algorithm 2). Only decode steps are
+        # recorded: one token per request per decode step, so the step wall
+        # time is the TBT that D_SLA bounds. Prefill steps are far longer and
+        # would poison the running average.
+        if not scheduler_output.is_prefill and scheduler_output.num_requests > 0:
+            record = getattr(self.scheduler, "record_decode_step", None)
+            if record is not None:
+                record(step_elapsed, scheduler_output.num_requests)
+        # SLA channel 2: record prefill steps (tokens, wall time) for the
+        # online prefill-rate estimate. With the knob off, record_prefill_step
+        # returns immediately and behaviour is bit-identical to before.
+        if scheduler_output.is_prefill and scheduler_output.num_requests > 0:
+            record_pf = getattr(self.scheduler, "record_prefill_step", None)
+            if record_pf is not None:
+                record_pf(
+                    getattr(scheduler_output, "num_scheduled_tokens", 0),
+                    step_elapsed,
+                )
         # Validate the entire returned batch before connector, KV, token or queue
         # consumption. Native writes/SPEC reservation commits already happened.
         if (
@@ -509,6 +580,25 @@ class LLM:
         skip_load: bool = False,
         enable_prefix_caching: bool = True,
         static_cache_capacity: int = 1,
+        enable_sla_constraint: bool = False,
+        sla_latency: float = 0.05,
+        sla_epsilon: float = 0.005,
+        batch_size_lower: int = 1,
+        batch_size_upper: int = 0,
+        sla_alpha: int = 8,
+        sla_sigma: int = 1,
+        sla_history_window: int = 100,
+        sla_queue_refill: bool = False,
+        sla_mem_bound_floor: bool = False,
+        sla_mem_bound_accurate: bool = False,
+        sla_admission_fallback: bool = False,
+        max_prefill_starvation_steps: int = 0,
+        enable_memory_aware_batching: bool = False,
+        memory_usage_factor: float = 0.95,
+        enable_batch_stats: bool = False,
+        enable_sla_prefill_ctrl: bool = False,
+        sla_prefill_budget_s: float = 4.0,
+        sla_prefill_chunk_min: int = 1024,
     ):
         """Initialize LLM.
 
@@ -562,6 +652,25 @@ class LLM:
             weight_load_mode=weight_load_mode,
             skip_load=skip_load,
             enable_prefix_caching=enable_prefix_caching,
+            enable_sla_constraint=enable_sla_constraint,
+            sla_latency=sla_latency,
+            sla_epsilon=sla_epsilon,
+            batch_size_lower=batch_size_lower,
+            batch_size_upper=batch_size_upper,
+            sla_alpha=sla_alpha,
+            sla_sigma=sla_sigma,
+            sla_history_window=sla_history_window,
+            sla_queue_refill=sla_queue_refill,
+            sla_mem_bound_floor=sla_mem_bound_floor,
+            sla_mem_bound_accurate=sla_mem_bound_accurate,
+            sla_admission_fallback=sla_admission_fallback,
+            max_prefill_starvation_steps=max_prefill_starvation_steps,
+            enable_memory_aware_batching=enable_memory_aware_batching,
+            memory_usage_factor=memory_usage_factor,
+            enable_batch_stats=enable_batch_stats,
+            enable_sla_prefill_ctrl=enable_sla_prefill_ctrl,
+            sla_prefill_budget_s=sla_prefill_budget_s,
+            sla_prefill_chunk_min=sla_prefill_chunk_min,
         )
         self.engine = LLMEngine(config)
         self.config = config
@@ -736,6 +845,25 @@ class AsyncLLMEngine:
         weight_load_mode: str = "async",
         enable_prefix_caching: bool = True,
         static_cache_capacity: int = 1,
+        enable_sla_constraint: bool = False,
+        sla_latency: float = 0.05,
+        sla_epsilon: float = 0.005,
+        batch_size_lower: int = 1,
+        batch_size_upper: int = 0,
+        sla_alpha: int = 8,
+        sla_sigma: int = 1,
+        sla_history_window: int = 100,
+        sla_queue_refill: bool = False,
+        sla_mem_bound_floor: bool = False,
+        sla_mem_bound_accurate: bool = False,
+        sla_admission_fallback: bool = False,
+        max_prefill_starvation_steps: int = 0,
+        enable_memory_aware_batching: bool = False,
+        memory_usage_factor: float = 0.95,
+        enable_batch_stats: bool = False,
+        enable_sla_prefill_ctrl: bool = False,
+        sla_prefill_budget_s: float = 4.0,
+        sla_prefill_chunk_min: int = 1024,
     ):
         """Initialize AsyncLLMEngine.
 
@@ -794,6 +922,25 @@ class AsyncLLMEngine:
             skip_load=skip_load,
             weight_load_mode=weight_load_mode,
             enable_prefix_caching=enable_prefix_caching,
+            enable_sla_constraint=enable_sla_constraint,
+            sla_latency=sla_latency,
+            sla_epsilon=sla_epsilon,
+            batch_size_lower=batch_size_lower,
+            batch_size_upper=batch_size_upper,
+            sla_alpha=sla_alpha,
+            sla_sigma=sla_sigma,
+            sla_history_window=sla_history_window,
+            sla_queue_refill=sla_queue_refill,
+            sla_mem_bound_floor=sla_mem_bound_floor,
+            sla_mem_bound_accurate=sla_mem_bound_accurate,
+            sla_admission_fallback=sla_admission_fallback,
+            max_prefill_starvation_steps=max_prefill_starvation_steps,
+            enable_memory_aware_batching=enable_memory_aware_batching,
+            memory_usage_factor=memory_usage_factor,
+            enable_batch_stats=enable_batch_stats,
+            enable_sla_prefill_ctrl=enable_sla_prefill_ctrl,
+            sla_prefill_budget_s=sla_prefill_budget_s,
+            sla_prefill_chunk_min=sla_prefill_chunk_min,
         )
         self.engine = LLMEngine(config)
         self.engine._async_abort_owner = True
