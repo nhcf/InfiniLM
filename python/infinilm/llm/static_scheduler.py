@@ -407,6 +407,19 @@ class StaticScheduler:
         """Static cache has no scheduler-side connector state to update."""
         return None
 
+    def record_decode_step(self, latency: float, batch_size: int) -> None:
+        """No-op: the static scheduler runs batch_size=1 and has no SLA loop."""
+        return None
+
+    def get_dynamic_batch_stats(self) -> dict:
+        """Interface parity with Scheduler: dynamic batching is unsupported here."""
+        return {
+            "enable_sla_constraint": False,
+            "enable_memory_aware_batching": False,
+            "max_batch_size": 1,
+            "note": "unsupported by static cache",
+        }
+
     def complete_requests(self, requests: List[InferenceRequest]):
         """Handle completed requests."""
         if len({id(req) for req in requests}) != len(requests):

@@ -3,8 +3,10 @@ Scheduler - Request scheduling and batch management with Paged Attention KV Cach
 """
 
 import logging
+import math
 import queue
 import threading
+from collections import deque
 from contextlib import ExitStack, contextmanager
 from typing import List, Optional
 
@@ -189,6 +191,22 @@ class Scheduler:
         num_mamba_cache_blocks: int | None = None,
         enable_prefix_caching: bool = True,
         nsa_owner_pool_epoch: int | None = None,
+        enable_sla_constraint: bool = False,
+        sla_latency: float = 0.05,
+        sla_epsilon: float = 0.005,
+        batch_size_lower: int = 1,
+        batch_size_upper: int = 0,
+        sla_alpha: int = 8,
+        sla_sigma: int = 1,
+        sla_history_window: int = 100,
+        sla_queue_refill: bool = False,
+        sla_mem_bound_floor: bool = False,
+        sla_mem_bound_accurate: bool = False,
+        sla_admission_fallback: bool = False,
+        max_prefill_starvation_steps: int = 0,
+        enable_memory_aware_batching: bool = False,
+        memory_usage_factor: float = 0.95,
+        enable_batch_stats: bool = False,
     ):
         if nsa_owner_pool_epoch is not None and (
             connector is not None or has_mamba_cache
@@ -236,6 +254,299 @@ class Scheduler:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.connector = connector
         self.enable_prefix_caching = enable_prefix_caching
+
+        # ------------------------------------------------------------------
+        # SLA / memory-aware dynamic batching (paper Algorithm 1 + 2).
+        # All flags default off: then current_max_batch_size stays pinned at
+        # max_batch_size and scheduling is identical to the static scheduler.
+        # Latency metric: decode-step wall time, measured in LLMEngine.step()
+        # (one token per request per decode step => step time is the TBT proxy).
+        # ------------------------------------------------------------------
+        self.enable_sla = enable_sla_constraint
+        self.enable_mem_aware = enable_memory_aware_batching
+        # Measurement only, no scheduling change; lets a control-arm run
+        # report the same decode latency / batch size numbers.
+        self.enable_batch_stats = bool(enable_batch_stats)
+        self.memory_usage_factor = memory_usage_factor
+        self.sla_latency = sla_latency
+        self.sla_low = sla_latency - sla_epsilon
+        self.sla_high = sla_latency + sla_epsilon
+        self.b_lower_hard = max(1, int(batch_size_lower))
+        # CUDA graphs are only captured up to max_batch_size, so B_max is
+        # hard-capped there (also validated in EngineConfig.__post_init__).
+        self.b_upper_hard = max(
+            self.b_lower_hard,
+            min(int(batch_size_upper) or max_batch_size, max_batch_size),
+        )
+        self.sla_alpha = int(sla_alpha)
+        self.sla_sigma = int(sla_sigma)
+        # Robustness knobs, all default off (off = bit-identical to before);
+        # each is documented at the site where it acts.
+        self.sla_queue_refill = bool(sla_queue_refill)
+        self.sla_mem_bound_floor = bool(sla_mem_bound_floor)
+        self.sla_mem_bound_accurate = bool(sla_mem_bound_accurate)
+        self.sla_admission_fallback = bool(sla_admission_fallback)
+        self.decode_latency_history: deque = deque(maxlen=int(sla_history_window))
+        self.decode_batch_history: deque = deque(maxlen=int(sla_history_window))
+        self.num_decode_steps = 0
+        # ---- Tier-1 probe: prefill starvation cap (see schedule()) ----
+        self.max_prefill_starvation_steps = max(0, int(max_prefill_starvation_steps))
+        self.prefill_starvation_steps = 0  # consecutive prefill-only steps
+        self.num_forced_decode_steps = 0  # how often the cap fired
+        self._force_decode_this_step = False
+        # Paper b_low_t / b_high_t, initialised to B_min / B_max.
+        self.b_low = self.b_lower_hard
+        self.b_high = self.b_upper_hard
+        if self.enable_sla or self.enable_mem_aware:
+            self.current_max_batch_size = self.b_upper_hard
+        else:
+            self.current_max_batch_size = max_batch_size
+        # Number of newly admitted (prefill) requests allowed this step; see
+        # _compute_prefill_budget().
+        self.prefill_budget = int(self.current_max_batch_size)
+        # Active (running) request count seen by the last schedule(); exposed
+        # for the debug endpoint.
+        self.num_running = 0
+
+    # ------------------------------------------------------------------
+    # SLA / memory-aware dynamic batching (paper Algorithm 1 + 2)
+    # ------------------------------------------------------------------
+
+    def record_decode_step(self, latency: float, batch_size: int) -> None:
+        """Record one decode step (latency, batch size) for the control loop.
+
+        Prefill steps must NOT be recorded: they are far longer and would
+        poison the running average. Also records in measurement-only mode
+        (``enable_batch_stats``).
+        """
+        if batch_size <= 0:
+            return
+        if not (self.enable_sla or self.enable_batch_stats):
+            return
+        self.decode_latency_history.append(float(latency))
+        self.decode_batch_history.append(int(batch_size))
+        self.num_decode_steps += 1
+
+    def _compute_prefill_budget(self, num_running: int) -> int:
+        """Max new (prefill) admissions this step.
+
+        With the controller on, ``current_max_batch_size`` bounds the *active
+        population*: running requests occupy part of it and only the remainder
+        admits new requests, keeping ``running <= cap`` so the decode phase
+        serves every running request in one pass (cap < running would
+        round-robin-skip requests, making TBT worse: +40% measured).
+
+        Controller off: returns ``current_max_batch_size`` (== max_batch_size),
+        identical to before.
+        """
+        if not (self.enable_sla or self.enable_mem_aware):
+            return int(self.current_max_batch_size)
+        # 0 = admit none this step and let the active set drain back under
+        # the cap (no preemption path, draining is the only way).
+        budget = max(0, int(self.current_max_batch_size) - int(num_running))
+        if self.sla_admission_fallback and budget <= 0:
+            # Budget welded to 0 (cap pushed down to the running count):
+            # admit what the pool's spare blocks can hold, capped at the
+            # algorithm's own population bound. See _spare_admission_slots().
+            ceiling = max(0, int(self.b_upper_hard) - int(num_running))
+            budget = min(self._spare_admission_slots(), ceiling)
+        return int(budget)
+
+    def _snapshot_history(self) -> tuple[List[float], List[int]]:
+        """Copy the history deques (a debug endpoint may read them from
+        another thread while the step thread appends)."""
+        for _ in range(3):
+            try:
+                return (
+                    list(self.decode_latency_history),
+                    list(self.decode_batch_history),
+                )
+            except RuntimeError:  # deque mutated during iteration
+                continue
+        return [], []
+
+    def _get_recent_decode_stats(self) -> tuple[float, float]:
+        """Return (avg decode step latency tau_bar, avg decode batch b_bar)."""
+        latencies, batches = self._snapshot_history()
+        if not latencies or not batches:
+            return 0.0, float(self.b_lower_hard)
+        avg_latency = sum(latencies) / len(latencies)
+        avg_batch = sum(batches) / len(batches)
+        return avg_latency, avg_batch
+
+    def _update_sla_bounds(self, num_decode_reqs: int, num_waiting: int = 0) -> int:
+        """Paper Algorithm 2: update the temporary bounds and return b_sla_t.
+
+        ``num_decode_reqs`` is N_t, the number of decode requests currently in
+        the running queue. The paper's line 15 requires the new batch size to
+        be at least N_t (requests already running cannot be evicted) and at
+        most B_max.
+        """
+        avg_latency, avg_batch = self._get_recent_decode_stats()
+
+        if avg_latency > self.sla_high:
+            # Above the SLA band: keep the upper bound close to what is
+            # actually running and walk the lower bound down.
+            self.b_high = max(avg_batch, self.b_low + self.sla_alpha)
+            self.b_low = max(self.b_low - self.sla_sigma, self.b_lower_hard)
+        elif avg_latency < self.sla_low:
+            # Below the SLA band: there is latency headroom, raise the bounds.
+            self.b_low = min(avg_batch, self.b_high - self.sla_alpha)
+            self.b_high = min(self.b_high + self.sla_sigma, self.b_upper_hard)
+        else:
+            # Inside the tolerance band: contract both bounds around b_bar.
+            half = math.floor(self.sla_alpha / 2)
+            self.b_high = min(avg_batch + half, self.b_upper_hard)
+            self.b_low = max(avg_batch - half, self.b_lower_hard)
+
+        # Demand term (``--sla-queue-refill``): with requests waiting and
+        # latency inside the SLA band, raise the lower bound to
+        # (running + waiting). Otherwise b_low is anchored to the observed
+        # batch, the cap hugs num_running, and a burst drains one completion
+        # at a time (384 requests: 11 s vs 6 s measured).
+        if self.sla_queue_refill and num_waiting > 0 and avg_latency <= self.sla_high:
+            need = min(num_decode_reqs + num_waiting, self.b_upper_hard)
+            if need > self.b_low:
+                self.b_low = need
+            if self.b_high < self.b_low:
+                self.b_high = self.b_low
+
+        new_batch = math.floor((self.b_low + self.b_high) / 2)
+        new_batch = min(max(new_batch, num_decode_reqs), self.b_upper_hard)
+        return int(new_batch)
+
+    def _running_request_blocks(self) -> tuple[int, int]:
+        """Return (total blocks, count) actually held by running requests.
+
+        Each request contributes len(block_table) plus the blocks its
+        remaining output needs. The pool-wide used/running ratio is not a
+        valid estimator: it also charges queued requests' reserved blocks and
+        prefix-cache blocks to the running set, collapsing the memory bound
+        (measured: hundreds -> 15-35, below B_min).
+
+        Iterates like can_accept_request (dequeue/re-queue; order preserved).
+        """
+        qsize = self.running_queue.sync_q.qsize()
+        total = 0
+        n = 0
+        for _ in range(qsize):
+            try:
+                req = self.running_queue.sync_q.get()
+            except queue.Empty:
+                break
+            try:
+                blocks = len(req.block_table)
+                remaining = max(
+                    0,
+                    int(req.sampling_params.max_tokens)
+                    - int(req.get_num_generated_tokens()),
+                )
+                blocks += (remaining + self.block_size - 1) // self.block_size
+                total += blocks
+                n += 1
+            except Exception:  # Skip a request with incomplete info.
+                pass
+            finally:
+                self.running_queue.sync_q.put(req)
+        return total, n
+
+    def _spare_admission_slots(self) -> int:
+        """How many new requests the pool's spare blocks can still admit.
+
+        Keeps 20% headroom for fragmentation and output growth; returns 0
+        when the pool is full, so the memory safety bound is unchanged.
+        Used by the ``--sla-admission-fallback`` path (background: cap ==
+        running count welded admission to 0 while queued requests held their
+        reserved blocks; at fixed concurrency 256 the budget was 0 for 72%
+        of the time, TTFT tail 62 s).
+        """
+        try:
+            free = int(self.cache_manager.get_num_free_blocks())
+            usable = int(self.cache_manager.get_total_usable_blocks())
+        except Exception:
+            return 0
+        if free <= 0 or usable <= 0:
+            return 0
+        total_blocks, n = self._running_request_blocks()
+        if n <= 0:
+            return 0
+        avg = max(1.0, total_blocks / float(n))
+        headroom = int(usable * 0.2)
+        return max(0, int((free - headroom) // avg))
+
+    def _compute_mem_bound(self, num_running: int) -> int:
+        """Paper Algorithm 1: b_mem_t = floor(blocks * eps_M / blocks_per_seq).
+
+        Never returns less than the number of running requests (they already
+        hold their blocks) and never more than B_max. ``pending_kv_decode_blocks``
+        is counted as used so that promoting WAITING_FOR_REMOTE_KVS requests
+        cannot over-commit the cache.
+        """
+        if num_running <= 0:
+            return self.b_upper_hard
+        if self.sla_mem_bound_accurate:
+            # Accurate caliber: only the blocks running requests actually
+            # hold (see _running_request_blocks). Off: pool-wide caliber.
+            total_blocks, n = self._running_request_blocks()
+            if n <= 0:
+                return self.b_upper_hard
+            blocks_per_seq = total_blocks / float(n)
+        else:
+            used = (
+                self.cache_manager.num_blocks - self.cache_manager.get_num_free_blocks()
+            )
+            used += self.pending_kv_decode_blocks
+            if used <= 0:
+                return self.b_upper_hard
+            blocks_per_seq = used / num_running
+        if blocks_per_seq <= 0:
+            return self.b_upper_hard
+        bound = math.floor(
+            self.cache_manager.num_blocks * self.memory_usage_factor / blocks_per_seq
+        )
+        # Floor (``--sla-mem-bound-floor``): an inflated blocks_per_seq (few
+        # running, many blocks held e.g. by the prefix cache) collapses the
+        # bound below B_min and welds admission to 0; clamp it to B_min.
+        # Off: floor=1, identical to before.
+        floor = self.b_lower_hard if self.sla_mem_bound_floor else 1
+        return int(max(bound, num_running, floor))
+
+    def get_dynamic_batch_stats(self) -> dict:
+        """Snapshot of the dynamic-batching control state (for logging/metrics)."""
+        avg_latency, avg_batch = self._get_recent_decode_stats()
+        return {
+            "enable_sla_constraint": self.enable_sla,
+            "enable_memory_aware_batching": self.enable_mem_aware,
+            "sla_queue_refill": self.sla_queue_refill,
+            "sla_mem_bound_floor": self.sla_mem_bound_floor,
+            "sla_mem_bound_accurate": self.sla_mem_bound_accurate,
+            "sla_admission_fallback": self.sla_admission_fallback,
+            "enable_batch_stats": self.enable_batch_stats,
+            "current_max_batch_size": self.current_max_batch_size,
+            # Active-population bound: num_running + prefill_budget <= cap.
+            "num_running": self.num_running,
+            "prefill_budget": self.prefill_budget,
+            "max_batch_size": self.max_batch_size,
+            "b_low": self.b_low,
+            "b_high": self.b_high,
+            "batch_size_lower": self.b_lower_hard,
+            "batch_size_upper": self.b_upper_hard,
+            "avg_decode_latency": avg_latency,
+            "avg_decode_batch": avg_batch,
+            "num_decode_steps": self.num_decode_steps,
+            # Tier-1 probe state: max_prefill_starvation_steps == 0 = off.
+            "max_prefill_starvation_steps": self.max_prefill_starvation_steps,
+            "prefill_starvation_steps": self.prefill_starvation_steps,
+            "num_forced_decode_steps": self.num_forced_decode_steps,
+            "sla_latency": self.sla_latency,
+            "sla_low": self.sla_low,
+            "sla_high": self.sla_high,
+            "sla_alpha": self.sla_alpha,
+            "sla_sigma": self.sla_sigma,
+            "memory_usage_factor": self.memory_usage_factor,
+            "num_free_blocks": self.cache_manager.get_num_free_blocks(),
+            "pending_kv_decode_blocks": self.pending_kv_decode_blocks,
+        }
 
     def add_request(self, request: InferenceRequest):
         if request is not None:
@@ -395,11 +706,44 @@ class Scheduler:
         current_num_batched_tokens = 0
         current_prefill_extra_blocks = 0
 
+        # Recompute the dynamic batch cap once per step (paper Algorithm 1 + 2).
+        # Runs in the single engine step thread, so no locking is needed.
+        self.num_running = self.running_queue.sync_q.qsize()
+        if self.enable_sla or self.enable_mem_aware:
+            num_decode = self.num_running
+            new_cap = self.current_max_batch_size
+            if self.enable_sla:
+                new_cap = self._update_sla_bounds(
+                    num_decode, self.waiting_queue.sync_q.qsize()
+                )
+            if self.enable_mem_aware:
+                new_cap = min(new_cap, self._compute_mem_bound(num_decode))
+            # Never below 1 (a cap of 0 would starve prefill *and* decode), and
+            # never above max_batch_size (CUDA graph capture ladder limit).
+            self.current_max_batch_size = min(max(int(new_cap), 1), self.max_batch_size)
+        # The cap is an active-population bound: this step only admits enough
+        # requests to bring running up to the cap, so the decode phase can
+        # serve every running request in one pass (no round-robin skip).
+        self.prefill_budget = self._compute_prefill_budget(self.num_running)
+
+        # ---- Tier-1 probe (``--max-prefill-starvation-steps``, 0 = off) ----
+        # With a non-empty waiting queue every step is pure prefill, so decode
+        # tokens wait for a whole prefill wave. After N consecutive
+        # prefill-only steps with requests running, force one decode step.
+        self._force_decode_this_step = False
+        if (
+            self.max_prefill_starvation_steps > 0
+            and self.num_running > 0
+            and self.prefill_starvation_steps >= self.max_prefill_starvation_steps
+        ):
+            self._force_decode_this_step = True
+
         # Process Waiting queue (prefill phase)
         waiting_to_inspect = self.waiting_queue.sync_q.qsize()
         while (
-            waiting_to_inspect > 0
-            and len(scheduled_requests) < self.max_batch_size
+            not self._force_decode_this_step
+            and waiting_to_inspect > 0
+            and len(scheduled_requests) < self.prefill_budget
             and current_num_batched_tokens < self.max_num_batched_tokens
         ):
             waiting_to_inspect -= 1
@@ -566,6 +910,7 @@ class Scheduler:
         # Return prefill batch if any waiting requests were scheduled
         if scheduled_requests:
             is_prefill = True
+            self.prefill_starvation_steps += 1
             if self._nsa_owner_clock is not None:
                 self.cache_manager.validate_nsa_request_writes(
                     scheduled_requests, decode=not is_prefill
@@ -589,7 +934,10 @@ class Scheduler:
 
         # Process Running queue (decode phase)
         running_to_inspect = self.running_queue.sync_q.qsize()
-        while running_to_inspect > 0 and len(scheduled_requests) < self.max_batch_size:
+        while (
+            running_to_inspect > 0
+            and len(scheduled_requests) < self.current_max_batch_size
+        ):
             running_to_inspect -= 1
             try:
                 req = self.running_queue.sync_q.get_nowait()
@@ -607,10 +955,22 @@ class Scheduler:
                 self.complete_requests([req])
                 continue
 
-            # Decode phase: allocate slot for newly generated token
-            req.block_table, new_slot = self.cache_manager.append_slot(
-                req.block_table, req.get_total_length()
-            )
+            # Decode phase: allocate slot for newly generated token.
+            # BlockManager.append_slot raises RuntimeError when the cache is
+            # exhausted. This engine has no preemption/swap path, so a request
+            # that cannot get a slot is deferred (put back and retried next
+            # step) instead of crashing the engine loop.
+            try:
+                req.block_table, new_slot = self.cache_manager.append_slot(
+                    req.block_table, req.get_total_length()
+                )
+            except RuntimeError:
+                logger.warning(
+                    "No available cache blocks for decode request %s, deferring.",
+                    req.request_id,
+                )
+                self.running_queue.sync_q.put(req)
+                break
             req.slot_mapping = [new_slot]
             req.num_blocks = len(req.block_table)
             req.num_local_cached_tokens = req.get_total_length() - 1
@@ -632,7 +992,7 @@ class Scheduler:
                     req.status = RequestStatus.WAITING
                     self.waiting_queue.sync_q.put(req)
                 elif req_id in self.finished_receiving_kv_req_ids:
-                    if len(scheduled_requests) < self.max_batch_size:
+                    if len(scheduled_requests) < self.current_max_batch_size:
                         logger.info(
                             f"Request {req_id[:8]}... finished receiving KV, scheduling for decode."
                         )
@@ -645,6 +1005,10 @@ class Scheduler:
         # Return decode batch if any running requests were scheduled
         if scheduled_requests:
             is_prefill = False
+            # A decode batch ends the starvation run.
+            self.prefill_starvation_steps = 0
+            if self._force_decode_this_step:
+                self.num_forced_decode_steps += 1
             if self._nsa_owner_clock is not None:
                 self.cache_manager.validate_nsa_request_writes(
                     scheduled_requests, decode=not is_prefill
