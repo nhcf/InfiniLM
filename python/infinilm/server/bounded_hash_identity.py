@@ -118,6 +118,7 @@ def metax_device_evidence():
         "logical_device": 0,
         "runtime_path": str(runtime_path.resolve()),
         "runtime_sha256": file_sha256(runtime_path),
+        "torch_preload_requested": os.environ.get("INFINILM_PRELOAD_TORCH") == "1",
     }
 
 
@@ -187,4 +188,6 @@ def validate_build_manifest(filename, expected, hardware):
         raise ValueError("The core extension is absent from native build evidence.")
     if hardware["runtime_sha256"] != identity["runtime"].get("mcruntime_sha256"):
         raise ValueError("The loaded MetaX runtime differs from build evidence.")
+    if hardware.get("torch_preload_requested") != identity["runtime"].get("torch_preload_requested"):
+        raise ValueError("The Torch lifecycle bootstrap differs from build evidence.")
     return identity, digest(identity)
