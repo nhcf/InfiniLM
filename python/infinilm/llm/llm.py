@@ -451,15 +451,13 @@ class LLMEngine:
                 req.finish_reason = FinishReason.EOS_TOKEN
                 return True
 
-            # While ignoring EOS, stop strings are also ignored to avoid requiring additional arguments for benchmarking.
-            # Check stop strings
-            # Remove stop string from generated_text if STOP_STRING is the finishing reason
-            stop_strings = req.sampling_params.stop or []
-            for stop_str in stop_strings:
-                if req.generated_text.endswith(stop_str):
-                    req.generated_text = req.generated_text[: -len(stop_str)]
-                    req.finish_reason = FinishReason.STOP_STRING
-                    return True
+        # Explicit stop strings remain active independently of EOS handling.
+        stop_strings = req.sampling_params.stop or []
+        for stop_str in stop_strings:
+            if req.generated_text.endswith(stop_str):
+                req.generated_text = req.generated_text[: -len(stop_str)]
+                req.finish_reason = FinishReason.STOP_STRING
+                return True
 
         max_tokens = req.sampling_params.max_tokens
         if max_tokens and req.get_num_generated_tokens() >= max_tokens:
