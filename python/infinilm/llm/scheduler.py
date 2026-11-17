@@ -596,6 +596,7 @@ class Scheduler:
                 req.num_local_cached_tokens = (
                     num_local_computed_tokens if load_kv_async else num_computed_tokens
                 )
+                req.capture_initial_cached_tokens()
                 if self.bounded_hash_observer is not None:
                     req._bounded_hash_initial_cached_tokens = int(
                         req.num_local_cached_tokens

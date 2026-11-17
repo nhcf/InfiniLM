@@ -3,9 +3,11 @@
 import argparse
 import asyncio
 import contextlib
+import copy
 import fcntl
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -44,11 +46,21 @@ def validate_request(body):
     """Accept the bounded text chat surface before any generation POST."""
     allowed = {
         "messages", "model", "stream", "stream_options", "max_tokens",
-        "temperature", "top_p", "top_k",
-        "add_generation_prompt", "chat_template_kwargs",
+        "temperature", "top_p", "top_k", "stop",
+        "add_generation_prompt", "chat_template_kwargs", "n", "ignore_eos",
+        "return_token_ids",
     }
     if not isinstance(body, dict) or set(body) - allowed:
         raise ValueError("Only the documented text chat fields are supported.")
+    if "n" in body and (type(body["n"]) is not int or body["n"] != 1):
+        raise ValueError("Only `n=1` is supported.")
+    for field in ("ignore_eos", "return_token_ids"):
+        if field in body and type(body[field]) is not bool:
+            raise ValueError(f"`{field}` must be boolean.")
+    if "stop" in body:
+        stops = [body["stop"]] if isinstance(body["stop"], str) else body["stop"]
+        if not isinstance(stops, list) or any(not isinstance(stop, str) or not stop for stop in stops):
+            raise ValueError("`stop` must be a string or list of nonempty strings.")
     if type(body.get("max_tokens")) is not int or body["max_tokens"] <= 0:
         raise ValueError("Supply a positive integer `max_tokens`.")
     if not isinstance(body.get("stream", False), bool):
@@ -79,6 +91,8 @@ class Gateway:
         )
         self.client = None
         self.quarantined = {}
+        self.peak_active = [0] * len(config.urls)
+        self.peak_reserved = [0] * len(config.urls)
 
     async def prepare(self, body):
         """Obtain token contracts from the replicas' existing tokenizers."""
@@ -123,8 +137,17 @@ class Gateway:
         usage = None
         done = False
         finish = None
+        queued_at = time.monotonic()
         try:
             lease = await self.router.acquire(item)
+            admitted_at = time.monotonic()
+            snapshot = self.router.snapshot()
+            self.peak_active = [max(old, current) for old, current in zip(
+                self.peak_active, snapshot["active"]
+            )]
+            self.peak_reserved = [max(old, current) for old, current in zip(
+                self.peak_reserved, snapshot["kv_reserved_tokens"]
+            )]
             backend = contracts[lease.worker]
             if lease.backend_instance_id != backend["backend_instance_id"]:
                 raise ValueError("Backend instance changed while awaiting admission.")
@@ -170,6 +193,17 @@ class Gateway:
             if type(generated) is not int or not 0 <= generated <= item["output_tokens"] or usage.get("prompt_tokens") != item["prompt_tokens"]:
                 raise ValueError("Backend usage violates the reserved token contract.")
             success = True
+            yield {
+                "choices": [],
+                "x_admission": {
+                    "backend": lease.worker,
+                    "queue_ms": (admitted_at - queued_at) * 1000,
+                    "peak_reserved_tokens": list(self.peak_reserved),
+                    "peak_inflight": list(self.peak_active),
+                    "route": dict(lease.route),
+                    "client_request_id": item.get("client_request_id"),
+                },
+            }
         finally:
             if lease is not None:
                 if attempted and not success:
@@ -201,12 +235,24 @@ def create_app(config):
 
     app = FastAPI(lifespan=lifespan)
 
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok", "quarantined": dict(gateway.quarantined),
+            "router": gateway.router.snapshot(),
+            "peak_inflight": list(gateway.peak_active),
+            "peak_reserved_tokens": list(gateway.peak_reserved),
+            "cache_observations": copy.deepcopy(gateway.router.cache),
+            "healthy": [worker.healthy for worker in gateway.router.workers],
+        }
+
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
         try:
             original = await request.json()
             body = validate_request(original)
             item, contracts = await gateway.prepare(body)
+            item["client_request_id"] = request.headers.get("X-Request-ID")
         except (ValueError, KeyError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except httpx.HTTPStatusError as exc:
@@ -221,7 +267,7 @@ def create_app(config):
                 async with contextlib.aclosing(gateway.generate(body, item, contracts)) as events:
                     async for event in events:
                         event.pop("x_infinilm", None)
-                        if not event.get("choices") and not event.get("usage"):
+                        if not event.get("choices") and not event.get("usage") and not event.get("x_admission"):
                             continue
                         if event.get("usage") and not (original.get("stream_options") or {}).get("include_usage", False):
                             if not event.get("choices"):
@@ -242,9 +288,16 @@ def create_app(config):
             result = None
             usage = None
             finish = None
+            token_ids = {}
+            admission = None
             async with contextlib.aclosing(gateway.generate(body, item, contracts)) as events:
                 async for event in events:
-                    result = event
+                    if event.get("id"):
+                        result = event
+                    admission = event.get("x_admission") or admission
+                    for field in ("prompt_token_ids", "generated_token_ids"):
+                        if field in event:
+                            token_ids[field] = event[field]
                     usage = event.get("usage") or usage
                     for choice in event.get("choices", []):
                         content.append(choice.get("delta", {}).get("content") or "")
@@ -254,6 +307,8 @@ def create_app(config):
                 "created": result["created"], "model": result["model"],
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(content)}, "finish_reason": finish, "logprobs": None}],
                 "usage": usage,
+                **token_ids,
+                "x_admission": admission,
             }
 
         async def disconnected():

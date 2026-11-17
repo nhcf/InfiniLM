@@ -6,6 +6,7 @@ if not INFINI_ROOT or INFINI_ROOT == "" then
     raise("INFINI_ROOT is required. Build the pinned stack using third_party/InfiniCore/README.md, then set INFINI_ROOT to its installed prefix.")
 end
 local CUDA_ROOT = os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH") or "/usr/local/cuda"
+local MACA_ROOT = os.getenv("MACA_PATH") or "/opt/maca"
 local NEUWARE_ROOT = os.getenv("NEUWARE_HOME") or "/usr/local/neuware"
 local ASCEND_ROOT = os.getenv("ASCEND_HOME_PATH") or os.getenv("ASCEND_TOOLKIT_HOME") or os.getenv("ASCEND_HOME") or "/usr/local/Ascend/ascend-toolkit/latest"
 local MUSA_ROOT =
@@ -50,6 +51,10 @@ end
 -- Add spdlog from third_party directory
 add_includedirs("third_party/spdlog/include")
 add_includedirs("third_party/json/single_include/")
+if os.isdir(MACA_ROOT .. "/include") then
+    add_includedirs(MACA_ROOT .. "/include")
+    add_linkdirs(MACA_ROOT .. "/lib", MACA_ROOT .. "/lib64")
+end
 if os.isdir(CUDA_ROOT .. "/include") then
     add_includedirs(CUDA_ROOT .. "/include")
 end

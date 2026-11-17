@@ -21,13 +21,17 @@ from pathlib import Path
 
 from infinilm.llm.prefix_cache import EMPTY_BLOCK_HASH, hash_block_tokens
 from infinilm.processors.basic_llm_processor import BasicLLMProcessor
+from infinilm.server.bounded_hash_identity import (
+    MANIFEST_ENV, metax_device_evidence, model_metadata, tokenizer_metadata,
+    validate_build_manifest,
+)
 
-_RUNTIME_REVISION = "ec6614ea32d778ce819aaa5c57e8ae3c7341a580"
 _ALLOWED_FIELDS = {
     "model", "messages", "prompt", "stream", "stream_options",
     "sampling_params", "temperature", "top_p", "top_k", "max_tokens",
     "max_completion_tokens", "max_new_tokens", "stop",
-    "add_generation_prompt", "chat_template_kwargs",
+    "add_generation_prompt", "chat_template_kwargs", "n", "ignore_eos",
+    "return_token_ids",
 }
 
 
@@ -67,6 +71,21 @@ class PrefixObservations:
     def publish(self, manager):
         """Read only published metadata on the scheduler's resource owner."""
         with self._lock:
+            allocator = {
+                "total_blocks": manager.num_blocks,
+                "free_list_blocks": len(manager.free_block_ids),
+                "resident_blocks": len(manager.used_block_ids),
+                "in_use_ref_positive_blocks": sum(
+                    block.ref_count > 0 for block in manager.blocks
+                ),
+                "reference_count_sum": sum(block.ref_count for block in manager.blocks),
+                "idle_resident_ref0_blocks": sum(
+                    manager.blocks[block_id].ref_count == 0
+                    for block_id in manager.used_block_ids
+                ),
+                "owner_thread_id": threading.get_ident(),
+                "scope": "Owner-thread CPU metadata; no pin/unpin or device reads.",
+            }
             prefixes = {}
             for digest, hashes in self._known.items():
                 resident = 0
@@ -85,6 +104,7 @@ class PrefixObservations:
                 "backend_instance_id": self.instance_id,
                 "epoch": self._epoch,
                 "prefixes": prefixes,
+                "cpu_allocator": allocator,
                 "observed_monotonic": time.monotonic(),
             }
 
@@ -95,10 +115,12 @@ class PrefixObservations:
                     "backend_instance_id": self.instance_id,
                     "epoch": 0,
                     "prefixes": {},
+                    "cpu_allocator": None,
                     "age_ms": None,
                 }
             value = dict(self._snapshot)
             value["prefixes"] = dict(value["prefixes"])
+            value["cpu_allocator"] = dict(value["cpu_allocator"])
             value["age_ms"] = max(
                 0.0, (time.monotonic() - value.pop("observed_monotonic")) * 1000
             )
@@ -180,7 +202,6 @@ class BoundedHashBackend:
             "device": server.device.split(":", 1)[0],
             "hardware_id": server.bounded_hash_hardware_id,
             "tensor_parallel_size": server.tensor_parallel_size,
-            "runtime_revision": _RUNTIME_REVISION,
             "execution_config": {
                 "attn_backend": server.attn_backend,
                 "enable_graph": server.enable_graph,
@@ -205,6 +226,24 @@ class BoundedHashBackend:
                 for name in sources
             },
         }
+        hardware = metax_device_evidence()
+        expected = {
+            "model": model_metadata(model_dir),
+            "tokenizer": tokenizer_metadata(model_dir),
+            "dtype": server.dtype,
+            "device": server.device.split(":", 1)[0],
+            "tensor_parallel_size": server.tensor_parallel_size,
+            "execution_config": self.identity["execution_config"],
+        }
+        build_identity, build_digest = validate_build_manifest(
+            os.environ.get(MANIFEST_ENV), expected, hardware,
+        )
+        self.identity["runtime_revision"] = build_identity["sources"]["infinilm_main_sha"]
+        self.identity["build_identity"] = build_identity
+        self.identity["build_identity_sha256"] = build_digest
+        self.device_evidence = {
+            key: value for key, value in hardware.items() if key != "common"
+        }
 
     def authorize(self, headers):
         if not secrets.compare_digest(
@@ -216,6 +255,19 @@ class BoundedHashBackend:
         if not isinstance(data, dict) or set(data) - _ALLOWED_FIELDS:
             raise BackendContractError("Unsupported bounded-hash request fields.", 400)
         data = dict(data)
+        if "n" in data and (type(data["n"]) is not int or data["n"] != 1):
+            raise BackendContractError("Only `n=1` is supported.", 400)
+        if "ignore_eos" in data and (
+            type(data["ignore_eos"]) is not bool
+            or data["ignore_eos"] != self.server.ignore_eos
+        ):
+            raise BackendContractError("Request `ignore_eos` must match the server setting.", 400)
+        if "return_token_ids" in data and type(data["return_token_ids"]) is not bool:
+            raise BackendContractError("`return_token_ids` must be boolean.", 400)
+        if "stop" in data:
+            stops = [data["stop"]] if isinstance(data["stop"], str) else data["stop"]
+            if not isinstance(stops, list) or any(not isinstance(stop, str) or not stop for stop in stops):
+                raise BackendContractError("`stop` must contain nonempty strings.", 400)
         messages = data.get("messages")
         if not messages and isinstance(data.get("prompt"), str):
             messages = [{"role": "user", "content": data["prompt"]}]
@@ -261,7 +313,7 @@ class BoundedHashBackend:
             or not math.isfinite(sampling.top_p) or not 0 < sampling.top_p <= 1
             or sampling.top_k < 0
             or not isinstance(sampling.stop, list)
-            or any(not isinstance(stop, str) for stop in sampling.stop)
+            or any(not isinstance(stop, str) or not stop for stop in sampling.stop)
         ):
             raise BackendContractError("Invalid sampling limits.", 400)
         return data, sampling
@@ -319,6 +371,7 @@ class BoundedHashBackend:
             "page_size": page, "kv_tokens": capacity,
             "cache_policy": self.cache_policy, "cache_snapshot": snapshot,
             "max_inflight": self.server.bounded_hash_max_inflight,
+            "device_evidence": self.device_evidence,
         }
 
     def validate_generation(self, data, headers):

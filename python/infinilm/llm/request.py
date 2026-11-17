@@ -208,6 +208,8 @@ class InferenceRequest:
         self.num_local_cached_tokens: int = (
             0  # Number of cached tokens visible to the current model step
         )
+        # Capture once on the scheduler owner before the first Prefill step.
+        self.initial_local_cached_tokens: Optional[int] = None
         self.num_computed_tokens: int = 0  # Total tokens computed (local + remote)
         # Chunked prefill state. chunked_prefill_pending is True while
         # prompt tokens remain to be scheduled in later chunks; the
@@ -266,6 +268,11 @@ class InferenceRequest:
         if self._output_queue is None:
             self._output_queue = janus.Queue()
         return self._output_queue
+
+    def capture_initial_cached_tokens(self):
+        """Freeze initial reuse independently of later Decode progress."""
+        if self.initial_local_cached_tokens is None:
+            self.initial_local_cached_tokens = int(self.num_local_cached_tokens)
 
     @property
     def prompt_token_ids(self) -> tuple[int, ...]:

@@ -464,6 +464,15 @@ class InferenceServer:
 
     def _build_sampling_params(self, data: dict) -> SamplingParams:
         """Build SamplingParams from request data."""
+        if "n" in data and (type(data["n"]) is not int or data["n"] != 1):
+            raise ValueError("Only a single completion (`n=1`) is supported.")
+        if "ignore_eos" in data and (
+            type(data["ignore_eos"]) is not bool
+            or data["ignore_eos"] != self.ignore_eos
+        ):
+            raise ValueError("Request `ignore_eos` must match the server setting.")
+        if "return_token_ids" in data and type(data["return_token_ids"]) is not bool:
+            raise ValueError("`return_token_ids` must be boolean.")
         # Support both:
         # - top-level OpenAI-ish fields: temperature/top_p/top_k/max_tokens/stop
         # - nested dict: sampling_params: { ... }
@@ -586,11 +595,12 @@ class InferenceServer:
                             last["choices"][0]["delta"] = delta
                             yield sse_json(last)
                         finish_reason = parser.finish_reason(finish_reason)
-                    yield sse_json(
-                        chunk_json(
-                            request_id, finish_reason=finish_reason, model=self.model_id
-                        )
+                    final_chunk = chunk_json(
+                        request_id, finish_reason=finish_reason, model=self.model_id
                     )
+                    if data.get("return_token_ids", False):
+                        final_chunk.update(self._token_ids_payload(req))
+                    yield sse_json(final_chunk)
                     if data.get("stream_options", {}).get("include_usage"):
                         yield sse_json(
                             {
@@ -605,6 +615,9 @@ class InferenceServer:
                                         "prompt_tokens": req.get_prompt_length(),
                                         "completion_tokens": req.get_num_generated_tokens(),
                                         "total_tokens": req.get_total_length(),
+                                        "prompt_tokens_details": {
+                                            "cached_tokens": req.initial_local_cached_tokens,
+                                        },
                                     }
                                 ),
                                 **({"x_infinilm": self._bounded_hash.info(req)}
@@ -716,6 +729,9 @@ class InferenceServer:
             if self._bounded_hash is not None:
                 response["usage"] = self._bounded_hash.usage(req)
                 response["x_infinilm"] = self._bounded_hash.info(req)
+            response["usage"]["prompt_tokens_details"] = {
+                "cached_tokens": req.initial_local_cached_tokens,
+            }
             parser = self._agent_parser(data, req)
             if parser:
                 response["choices"][0]["message"] = collect_message(
@@ -726,6 +742,8 @@ class InferenceServer:
                 response["choices"][0]["finish_reason"] = parser.finish_reason(
                     finish_reason or "stop"
                 )
+            if data.get("return_token_ids", False):
+                response.update(self._token_ids_payload(req))
             return response
 
         except asyncio.CancelledError:
@@ -749,6 +767,14 @@ class InferenceServer:
                 self.engine.add_aborted_req(req, _abort_reason)
             if self._bounded_hash is not None and token_stream is not None:
                 await token_stream.aclose()
+
+    @staticmethod
+    def _token_ids_payload(req):
+        """Return actual scheduler token IDs for independent validation."""
+        return {
+            "prompt_token_ids": [int(token) for token in req.prompt_token_ids],
+            "generated_token_ids": [int(token) for token in req.generated_token_ids],
+        }
 
     def _agent_parser(self, data, req):
         if self.tool_call_parser == "none":
