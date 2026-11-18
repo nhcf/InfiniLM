@@ -1,0 +1,149 @@
+From 423ba98eb779545b6d2086bf0c3cfc8f85654b41 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local.invalid>
+Date: Tue, 17 Nov 2026 09:42:19 +0800
+Subject: [PATCH] fix(metax): provide separate-table RoPE and link embedded
+ Python
+
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bf0cb2f4e01a4ce5ada51909fbb3ea1dcfb1c063..f3b292a5a71c6cecbec7c27e739c87fd0fb0e10e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -283,7 +283,7 @@ endif()
+  # consume DLPack views and their own runtime. Discover Torch lazily only when
+  # native Torch wrappers or a selected linked Torch transport need it.
+ macro(infiniops_find_torch)
+-    if(WITH_MARS AND WITH_TORCH AND WITH_LINKED)
++    if((WITH_MARS OR WITH_METAX) AND WITH_TORCH AND WITH_LINKED)
+         find_package(Python COMPONENTS Interpreter Development.Embed REQUIRED)
+     else()
+         find_package(Python COMPONENTS Interpreter REQUIRED)
+@@ -351,8 +351,8 @@ macro(infiniops_find_torch)
+             -Wl,--no-as-needed ${TORCH_HIP_LIB} ${C10_HIP_LIB} -Wl,--as-needed)
+     endif()
+
+-    if(WITH_MARS AND WITH_TORCH AND WITH_LINKED)
+-        # The Mars FlashAttention wheel loads libtorch_python without declaring
++    if((WITH_MARS OR WITH_METAX) AND WITH_TORCH AND WITH_LINKED)
++        # The Mars/MetaX FlashAttention wheels load libtorch_python without declaring
+         # its libpython dependency, so keep the embedding library in our chain.
+         list(APPEND TORCH_LIBRARIES Python::Python)
+     endif()
+diff --git a/src/base/separate_table_rope.h b/src/base/separate_table_rope.h
+index a04bfd082db9033cc4c6824017d560bcf8731b04..20d11a878a62897cd4744f4b8c0cf8d6615e1a7e 100644
+--- a/src/base/separate_table_rope.h
++++ b/src/base/separate_table_rope.h
+@@ -20,20 +20,21 @@ class SeparateTableRope : public Operator<SeparateTableRope> {
+                        const Tensor sin_table, const Tensor cos_table,
+                        bool /*is_neox*/, const Tensor out) {
+     const auto rank = input.ndim();
+-    // Preserve the CPU table dtype domain. NVIDIA additionally retains LM's
++    // Preserve the CPU table dtype domain. NVIDIA/MetaX additionally retain LM's
+     // independently typed tables and padded per-batch position rows.
+-    const bool nvidia = input.device().type() == Device::Type::kNvidia;
++    const bool cuda_like = input.device().type() == Device::Type::kNvidia ||
++                           input.device().type() == Device::Type::kMetax;
+     if ((rank != 3 && rank != 4) || out.shape() != input.shape() ||
+         out.dtype() != input.dtype() ||
+         cos_table.dtype() != sin_table.dtype() ||
+-        (!nvidia && sin_table.dtype() != input.dtype()))
++        (!cuda_like && sin_table.dtype() != input.dtype()))
+       return false;
+     if (input.dtype() != DataType::kFloat16 &&
+         input.dtype() != DataType::kBFloat16 &&
+         input.dtype() != DataType::kFloat32 &&
+         input.dtype() != DataType::kFloat64)
+       return false;
+-    if (nvidia && (input.dtype() == DataType::kFloat64 ||
++    if (cuda_like && (input.dtype() == DataType::kFloat64 ||
+                    (sin_table.dtype() != DataType::kFloat16 &&
+                     sin_table.dtype() != DataType::kBFloat16 &&
+                     sin_table.dtype() != DataType::kFloat32)))
+@@ -47,7 +48,7 @@ class SeparateTableRope : public Operator<SeparateTableRope> {
+         positions.dtype() != DataType::kUInt32 &&
+         positions.dtype() != DataType::kUInt64)
+       return false;
+-    if (nvidia && positions.dtype() != DataType::kInt32 &&
++    if (cuda_like && positions.dtype() != DataType::kInt32 &&
+         positions.dtype() != DataType::kInt64)
+       return false;
+     if (input.device() != out.device() ||
+@@ -62,7 +63,7 @@ class SeparateTableRope : public Operator<SeparateTableRope> {
+     } else if (positions.ndim() == 2) {
+       if (positions.size(0) != batch || positions.size(1) != seq ||
+           positions.stride(1) != 1 ||
+-          (!nvidia && positions.stride(0) != static_cast<Tensor::Stride>(seq)))
++          (!cuda_like && positions.stride(0) != static_cast<Tensor::Stride>(seq)))
+         return false;
+     } else
+       return false;
+diff --git a/src/native/cuda/metax/ops/separate_table_rope/kernel.h b/src/native/cuda/metax/ops/separate_table_rope/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..dce0902f0693c6ca007e36e5bf24ed94203ec923
+--- /dev/null
++++ b/src/native/cuda/metax/ops/separate_table_rope/kernel.h
+@@ -0,0 +1,23 @@
++#ifndef INFINI_OPS_METAX_SEPARATE_TABLE_ROPE_KERNEL_H_
++#define INFINI_OPS_METAX_SEPARATE_TABLE_ROPE_KERNEL_H_
++#include "native/cuda/metax/caster.cuh"
++#include "native/cuda/metax/runtime_.h"
++#include "native/cuda/ops/separate_table_rope/kernel.h"
++namespace infini::ops {
++template <>
++class Operator<SeparateTableRope, Device::Type::kMetax>
++    : public CudaSeparateTableRope<Runtime<Device::Type::kMetax>> {
++ public:
++  using CudaSeparateTableRope<Runtime<Device::Type::kMetax>>::CudaSeparateTableRope;
++  void operator()(const Tensor x, const Tensor p, const Tensor s,
++                  const Tensor c, bool neox, Tensor y) const override {
++    CudaSeparateTableRope<Runtime<Device::Type::kMetax>>::operator()(x,p,s,c,neox,y);
++    if (x.numel() == 0) return;
++    // Detect launch errors without synchronizing the production stream.
++    const auto status = mcPeekAtLastError();
++    if (status != mcSuccess)
++      throw std::runtime_error(mcGetErrorString(status));
++  }
++};
++}  // namespace infini::ops
++#endif
+diff --git a/src/native/cuda/ops/separate_table_rope/kernel.h b/src/native/cuda/ops/separate_table_rope/kernel.h
+index 5d0a44e6a32074fff43fc0f1547f1881d703da57..fbbfc1ce474c40ba9784506c9f90105c6fd40c19 100644
+--- a/src/native/cuda/ops/separate_table_rope/kernel.h
++++ b/src/native/cuda/ops/separate_table_rope/kernel.h
+@@ -10,7 +10,8 @@ class CudaSeparateTableRope : public SeparateTableRope {
+  public:
+   static bool supports(const Tensor x, const Tensor p, const Tensor s,
+                        const Tensor c, bool neox, const Tensor y) {
+-    if (Backend::kDeviceType != Device::Type::kNvidia ||
++    if ((Backend::kDeviceType != Device::Type::kNvidia &&
++         Backend::kDeviceType != Device::Type::kMetax) ||
+         !SeparateTableRope::supports(x, p, s, c, neox, y))
+       return false;
+     return separate_rope_nvidia::layout_supported(x, p, s, c, neox, y);
+@@ -24,7 +25,7 @@ class CudaSeparateTableRope : public SeparateTableRope {
+     // Positions must be in [0, s.size(0)).
+     if (!separate_rope_nvidia::layout_supported(x, p, s, c, neox, y))
+       throw std::invalid_argument(
+-          "SeparateTableRope: NVIDIA unsupported rebind");
++          "SeparateTableRope: GPU unsupported rebind");
+     if (x.numel() == 0) return;
+     const auto rank = x.ndim();
+     const bool batched = rank == 4;
+@@ -64,7 +65,7 @@ class CudaSeparateTableRope : public SeparateTableRope {
+           else
+             launch(std::true_type{});
+         },
+-        "SeparateTableRope NVIDIA");
++        "SeparateTableRope CUDA-like GPU");
+   }
+
+  private:
+@@ -72,7 +73,7 @@ class CudaSeparateTableRope : public SeparateTableRope {
+     const int block = RuntimeUtils<Backend::kDeviceType>::GetOptimalBlockSize();
+     if (block != 128 && block != 256 && block != 512 && block != 1024)
+       throw std::runtime_error(
+-          "SeparateTableRope: unsupported NVIDIA block size");
++          "SeparateTableRope: unsupported GPU block size");
+     return block;
+   }
+   const int block_size_;

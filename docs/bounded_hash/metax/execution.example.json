@@ -1,0 +1,15 @@
+{
+  "attn_backend": "flash-attn",
+  "enable_graph": true,
+  "pre_transpose": false,
+  "max_batch_size": 3,
+  "ignore_eos": true,
+  "weight_load_mode": "async",
+  "chunked_prefill_size": 0,
+  "cache_type": "paged",
+  "enable_prefix_caching": true,
+  "use_mla": false,
+  "max_cache_len": 8224,
+  "max_tokens": 32,
+  "max_num_batched_tokens": 8192
+}

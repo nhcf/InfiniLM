@@ -1,0 +1,3147 @@
+From 5065e6342f6c6923db759846aa09a753c54525ff Mon Sep 17 00:00:00 2001
+From: rubik <huajianfeng@zhejianglab.com>
+Date: Tue, 10 Nov 2026 17:34:52 +0800
+Subject: [PATCH] feat(metax): add MoE, GDN, quantization and attention
+ operators for MetaX GPUs
+
+  Add native MetaX (MACA) device kernels and linked torch operator
+  providers so InfiniLM can run on MetaX C550 GPUs:
+
+  - Native ops (src/native/cuda/metax): moe_fused_gate,
+    moe_fused_dense, deepseek_moe, chunked/recurrent gated delta
+    rule (linear attention), mamba_selective_scan, causal_conv1d,
+    mrope, w4_marlin, per-tensor/per-channel int8 quant kernels
+  - Linked torch ops (src/linked/torch/metax): vLLM providers for
+    moe_align_block_size, topk_sigmoid, quick_gelu; ATen providers
+    for layer_norm, pad; flash_attn_varlen_func, rms_norm and
+    silu_and_mul updates
+  - Shared CUDA reference kernels for moe_fused_dense
+    (src/native/cuda/ops)
+
+  Validated end-to-end with qwen3.8-27B (TP2, batch size 1): TTFT 350.23 ms, decode 29.78 tok/s.
+
+diff --git a/src/linked/torch/metax/mcoplib.yaml b/src/linked/torch/metax/mcoplib.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..4247fea7864a4719395cecb3b80d05a17cfe6db6
+--- /dev/null
++++ b/src/linked/torch/metax/mcoplib.yaml
+@@ -0,0 +1,2 @@
++python_distribution_package: mcoplib
++library_glob: mcoplib/_C*.so
+diff --git a/src/linked/torch/metax/mcoplib_moe.yaml b/src/linked/torch/metax/mcoplib_moe.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9f6a42038d4629ad27f725ebd6663b35fc8ec8b
+--- /dev/null
++++ b/src/linked/torch/metax/mcoplib_moe.yaml
+@@ -0,0 +1,2 @@
++python_distribution_package: mcoplib
++library_glob: mcoplib/_moe_C*.so
+diff --git a/src/linked/torch/metax/ops/flash_attn_varlen_func/flash_attn.cc b/src/linked/torch/metax/ops/flash_attn_varlen_func/flash_attn.cc
+index 27b62f01c1028939d7dc8b833982a00d2360d64b..32ca75de9d2b2fa62bdbb5fc6de3a2baae58a2c4 100644
+--- a/src/linked/torch/metax/ops/flash_attn_varlen_func/flash_attn.cc
++++ b/src/linked/torch/metax/ops/flash_attn_varlen_func/flash_attn.cc
+@@ -15,7 +15,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
+     float dropout_p, float softmax_scale, bool zero_tensors, bool causal,
+     int window_size_left, int window_size_right, float softcap,
+     bool return_softmax, std::optional<at::Generator> generator,
+-    std::optional<at::Tensor>& flash_attn_mars_ext);
++    std::optional<at::Tensor>& flash_attn_mars_ext, bool return_max_logit);
+
+ namespace infini::ops::linked::torch::metax {
+
+@@ -36,7 +36,8 @@ struct FlashAttnVarlen : C10<Device::Type::kMetax> {
+                             max_seqlen_k, dropout_p, softmax_scale,
+                             zero_tensors, causal, window_size_left,
+                             window_size_right, softcap, return_softmax,
+-                            generator, flash_attn_mars_ext);
++                            generator, flash_attn_mars_ext,
++                            /*return_max_logit=*/false);
+   }
+ };
+
+diff --git a/src/linked/torch/metax/ops/flash_attn_varlen_func/flash_attn.yaml b/src/linked/torch/metax/ops/flash_attn_varlen_func/flash_attn.yaml
+index c692e1abda743847e3642ec9bd5816f9d7caf428..874420dc4fe352dbedef60116cfba649067366a5 100644
+--- a/src/linked/torch/metax/ops/flash_attn_varlen_func/flash_attn.yaml
++++ b/src/linked/torch/metax/ops/flash_attn_varlen_func/flash_attn.yaml
+@@ -1,4 +1,4 @@
+ library: flash_attn
+ required_symbols:
+   - >-
+-    mha_varlen_fwd(at::Tensor&, at::Tensor const&, at::Tensor const&, std::optional<at::Tensor>&, at::Tensor const&, at::Tensor const&, std::optional<at::Tensor>&, std::optional<at::Tensor const>&, std::optional<at::Tensor>&, std::optional<at::Tensor>&, int, int, float, float, bool, bool, int, int, float, bool, std::optional<at::Generator>, std::optional<at::Tensor>&)
++    mha_varlen_fwd(at::Tensor&, at::Tensor const&, at::Tensor const&, std::optional<at::Tensor>&, at::Tensor const&, at::Tensor const&, std::optional<at::Tensor>&, std::optional<at::Tensor const>&, std::optional<at::Tensor>&, std::optional<at::Tensor>&, int, int, float, float, bool, bool, int, int, float, bool, std::optional<at::Generator>, std::optional<at::Tensor>&, bool)
+diff --git a/src/linked/torch/metax/ops/layer_norm/aten.cc b/src/linked/torch/metax/ops/layer_norm/aten.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..e656967b9f84ade0126d0d09f1f21e5917171d3d
+--- /dev/null
++++ b/src/linked/torch/metax/ops/layer_norm/aten.cc
+@@ -0,0 +1,8 @@
++#include "linked/torch/metax/ops/layer_norm/aten.h"
++
++namespace infini::ops::linked::torch {
++
++template class TorchLayerNorm<
++    ::infini::ops::linked::torch::metax::AtenLayerNorm>;
++
++}  // namespace infini::ops::linked::torch
+diff --git a/src/linked/torch/metax/ops/layer_norm/aten.h b/src/linked/torch/metax/ops/layer_norm/aten.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc3c0278764a808e7c58c23d5b3f0d29e0425af2
+--- /dev/null
++++ b/src/linked/torch/metax/ops/layer_norm/aten.h
+@@ -0,0 +1,37 @@
++#ifndef INFINI_OPS_LINKED_TORCH_METAX_OPS_LAYER_NORM_ATEN_H_
++#define INFINI_OPS_LINKED_TORCH_METAX_OPS_LAYER_NORM_ATEN_H_
++
++#include <ATen/ops/native_layer_norm.h>
++
++#include "linked/torch/ops/layer_norm.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct AtenLayerNorm : C10<Device::Type::kMetax> {};
++
++}  // namespace infini::ops::linked::torch::metax
++
++namespace infini::ops::linked::torch {
++
++extern template class TorchLayerNorm<
++    ::infini::ops::linked::torch::metax::AtenLayerNorm>;
++
++}  // namespace infini::ops::linked::torch
++
++namespace infini::ops {
++
++template <>
++class Operator<LayerNorm, Device::Type::kMetax, 0>
++    : public linked::torch::TorchLayerNorm<
++          linked::torch::metax::AtenLayerNorm> {
++ public:
++  using linked::torch::TorchLayerNorm<
++      linked::torch::metax::AtenLayerNorm>::TorchLayerNorm;
++  using linked::torch::TorchLayerNorm<
++      linked::torch::metax::AtenLayerNorm>::operator();
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_LINKED_TORCH_METAX_OPS_LAYER_NORM_ATEN_H_
+diff --git a/src/linked/torch/metax/ops/layer_norm/aten.yaml b/src/linked/torch/metax/ops/layer_norm/aten.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e15f353158cdc918d744fdbb4f1f0c824915e8c
+--- /dev/null
++++ b/src/linked/torch/metax/ops/layer_norm/aten.yaml
+@@ -0,0 +1,6 @@
++library: mcoplib
++operator_schema: >-
++  aten::native_layer_norm(Tensor input, SymInt[] normalized_shape,
++  Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor,
++  Tensor)
++dispatch_key: CUDA
+diff --git a/src/linked/torch/metax/ops/moe_align_block_size/vllm.cc b/src/linked/torch/metax/ops/moe_align_block_size/vllm.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d2f7172c2af5107dc4ca4ebba8758b8d5f14011
+--- /dev/null
++++ b/src/linked/torch/metax/ops/moe_align_block_size/vllm.cc
+@@ -0,0 +1,8 @@
++#include "linked/torch/metax/ops/moe_align_block_size/vllm.h"
++
++namespace infini::ops::linked::torch {
++
++template class TorchMoeAlignBlockSize<
++    ::infini::ops::linked::torch::metax::VllmMoeAlignBlockSize>;
++
++}  // namespace infini::ops::linked::torch
+diff --git a/src/linked/torch/metax/ops/moe_align_block_size/vllm.h b/src/linked/torch/metax/ops/moe_align_block_size/vllm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e5d5603973ae4fb62114e3499a2bcd5015f3adb
+--- /dev/null
++++ b/src/linked/torch/metax/ops/moe_align_block_size/vllm.h
+@@ -0,0 +1,66 @@
++#ifndef INFINI_OPS_LINKED_TORCH_METAX_OPS_MOE_ALIGN_BLOCK_SIZE_VLLM_H_
++#define INFINI_OPS_LINKED_TORCH_METAX_OPS_MOE_ALIGN_BLOCK_SIZE_VLLM_H_
++
++#include <ATen/core/dispatch/Dispatcher.h>
++#include <ATen/core/stack.h>
++
++#include <cassert>
++#include <utility>
++
++#include "linked/torch/ops/moe_align_block_size.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct VllmMoeAlignBlockSize : C10<Device::Type::kMetax> {
++  static void Call(at::Tensor topk_ids, int64_t num_experts, int64_t block_size,
++                   at::Tensor sorted_token_ids, at::Tensor experts_ids,
++                   at::Tensor num_tokens_post_pad,
++                   std::optional<at::Tensor> maybe_expert_map) {
++    static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
++        "_moe_C::moe_align_block_size", "");
++    c10::Stack stack;
++    stack.reserve(7);
++    stack.emplace_back(std::move(topk_ids));
++    stack.emplace_back(num_experts);
++    stack.emplace_back(block_size);
++    stack.emplace_back(std::move(sorted_token_ids));
++    stack.emplace_back(std::move(experts_ids));
++    stack.emplace_back(std::move(num_tokens_post_pad));
++    if (maybe_expert_map.has_value()) {
++      stack.emplace_back(std::move(*maybe_expert_map));
++    } else {
++      stack.emplace_back();
++    }
++    op.callBoxed(&stack);
++
++    assert(stack.empty() &&
++           "`moe_align_block_size` returned an unexpected number of values");
++  }
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
++namespace infini::ops::linked::torch {
++
++extern template class TorchMoeAlignBlockSize<
++    ::infini::ops::linked::torch::metax::VllmMoeAlignBlockSize>;
++
++}  // namespace infini::ops::linked::torch
++
++namespace infini::ops {
++
++template <>
++class Operator<MoeAlignBlockSize, Device::Type::kMetax, 0>
++    : public linked::torch::TorchMoeAlignBlockSize<
++          linked::torch::metax::VllmMoeAlignBlockSize> {
++ public:
++  using linked::torch::TorchMoeAlignBlockSize<
++      linked::torch::metax::VllmMoeAlignBlockSize>::TorchMoeAlignBlockSize;
++  using linked::torch::TorchMoeAlignBlockSize<
++      linked::torch::metax::VllmMoeAlignBlockSize>::operator();
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_LINKED_TORCH_METAX_OPS_MOE_ALIGN_BLOCK_SIZE_VLLM_H_
+diff --git a/src/linked/torch/metax/ops/moe_align_block_size/vllm.yaml b/src/linked/torch/metax/ops/moe_align_block_size/vllm.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..d94b147a6f9ac380a4e47bbbcb35239a82c3580d
+--- /dev/null
++++ b/src/linked/torch/metax/ops/moe_align_block_size/vllm.yaml
+@@ -0,0 +1,5 @@
++library: mcoplib_moe
++required_symbols:
++  - >-
++    moe_align_block_size(at::Tensor, long, long, at::Tensor, at::Tensor,
++    at::Tensor, std::optional<at::Tensor>)
+diff --git a/src/linked/torch/metax/ops/pad/aten.cc b/src/linked/torch/metax/ops/pad/aten.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..1426d31634f2ae4b5086199f0a38d17b1374ef75
+--- /dev/null
++++ b/src/linked/torch/metax/ops/pad/aten.cc
+@@ -0,0 +1,7 @@
++#include "linked/torch/metax/ops/pad/aten.h"
++
++namespace infini::ops::linked::torch {
++
++template class TorchPad<::infini::ops::linked::torch::metax::AtenPad>;
++
++}  // namespace infini::ops::linked::torch
+diff --git a/src/linked/torch/metax/ops/pad/aten.h b/src/linked/torch/metax/ops/pad/aten.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..50164fe53f7e2b479e73ada68b594905702affd4
+--- /dev/null
++++ b/src/linked/torch/metax/ops/pad/aten.h
+@@ -0,0 +1,53 @@
++#ifndef INFINI_OPS_LINKED_TORCH_METAX_OPS_PAD_ATEN_H_
++#define INFINI_OPS_LINKED_TORCH_METAX_OPS_PAD_ATEN_H_
++
++#include <ATen/core/dispatch/Dispatcher.h>
++#include <ATen/core/stack.h>
++
++#include <cassert>
++#include <optional>
++#include <vector>
++
++#include "linked/torch/ops/pad.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct AtenPad : C10<Device::Type::kMetax> {
++  static void Call(at::Tensor out, at::Tensor input, std::vector<int64_t> pad,
++                   double value) {
++    static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
++        "aten::constant_pad_nd", "");
++    c10::Stack stack;
++    stack.reserve(4);
++    stack.emplace_back(std::move(input));
++    stack.emplace_back(c10::List<int64_t>(pad));
++    stack.emplace_back(value);
++    op.callBoxed(&stack);
++    TORCH_CHECK(stack.size() == 1,
++                "`constant_pad_nd` returned unexpected values.");
++    out.copy_(stack.front().toTensor());
++  }
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
++namespace infini::ops::linked::torch {
++
++extern template class TorchPad< ::infini::ops::linked::torch::metax::AtenPad>;
++
++}  // namespace infini::ops::linked::torch
++
++namespace infini::ops {
++
++template <>
++class Operator<Pad, Device::Type::kMetax, 0>
++    : public linked::torch::TorchPad<linked::torch::metax::AtenPad> {
++ public:
++  using linked::torch::TorchPad<linked::torch::metax::AtenPad>::TorchPad;
++  using linked::torch::TorchPad<linked::torch::metax::AtenPad>::operator();
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_LINKED_TORCH_METAX_OPS_PAD_ATEN_H_
+diff --git a/src/linked/torch/metax/ops/pad/aten.yaml b/src/linked/torch/metax/ops/pad/aten.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..6da0c6054fc62892023a50e078cdc8277b8c2854
+--- /dev/null
++++ b/src/linked/torch/metax/ops/pad/aten.yaml
+@@ -0,0 +1,4 @@
++library: mcoplib
++operator_schema: >-
++  aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor
++dispatch_key: CompositeExplicitAutograd
+diff --git a/src/linked/torch/metax/ops/quick_gelu/vllm.cc b/src/linked/torch/metax/ops/quick_gelu/vllm.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b4e19a5bf23d5b8e51e2d75d491823d7142843c
+--- /dev/null
++++ b/src/linked/torch/metax/ops/quick_gelu/vllm.cc
+@@ -0,0 +1,19 @@
++#include "linked/torch/metax/ops/quick_gelu/vllm.h"
++
++// MetaX vLLM `_C` exports this global C++ symbol.
++void gelu_quick(at::Tensor& out, at::Tensor& input);
++
++namespace infini::ops::linked::torch::metax {
++
++void VllmQuickGelu::Call(at::Tensor& out, at::Tensor& input) {
++  ::gelu_quick(out, input);
++}
++
++}  // namespace infini::ops::linked::torch::metax
++
++namespace infini::ops::linked::torch {
++
++template class TorchQuickGelu<
++    ::infini::ops::linked::torch::metax::VllmQuickGelu>;
++
++}  // namespace infini::ops::linked::torch
+diff --git a/src/linked/torch/metax/ops/quick_gelu/vllm.h b/src/linked/torch/metax/ops/quick_gelu/vllm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae3c4ddbcaa2b99dbdd5dcabd22e8e73caddf40e
+--- /dev/null
++++ b/src/linked/torch/metax/ops/quick_gelu/vllm.h
+@@ -0,0 +1,37 @@
++#ifndef INFINI_OPS_LINKED_TORCH_METAX_OPS_QUICK_GELU_VLLM_H_
++#define INFINI_OPS_LINKED_TORCH_METAX_OPS_QUICK_GELU_VLLM_H_
++
++#include "linked/torch/ops/quick_gelu.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct VllmQuickGelu : C10<Device::Type::kMetax> {
++  static void Call(at::Tensor& out, at::Tensor& input);
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
++namespace infini::ops::linked::torch {
++
++extern template class TorchQuickGelu<
++    ::infini::ops::linked::torch::metax::VllmQuickGelu>;
++
++}  // namespace infini::ops::linked::torch
++
++namespace infini::ops {
++
++template <>
++class Operator<QuickGelu, Device::Type::kMetax, 16>
++    : public linked::torch::TorchQuickGelu<
++          linked::torch::metax::VllmQuickGelu> {
++ public:
++  using linked::torch::TorchQuickGelu<
++      linked::torch::metax::VllmQuickGelu>::TorchQuickGelu;
++  using linked::torch::TorchQuickGelu<
++      linked::torch::metax::VllmQuickGelu>::operator();
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_LINKED_TORCH_METAX_OPS_QUICK_GELU_VLLM_H_
+diff --git a/src/linked/torch/metax/ops/quick_gelu/vllm.yaml b/src/linked/torch/metax/ops/quick_gelu/vllm.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..c026ad592aec6cbe7efce8edb9aff1b1e66595ef
+--- /dev/null
++++ b/src/linked/torch/metax/ops/quick_gelu/vllm.yaml
+@@ -0,0 +1,3 @@
++library: mcoplib
++required_symbols:
++  - gelu_quick(at::Tensor&, at::Tensor&)
+diff --git a/src/linked/torch/metax/ops/rms_norm/vllm.yaml b/src/linked/torch/metax/ops/rms_norm/vllm.yaml
+index cfed9bbc16ac31c2fd52ec6b759e4af1955707fa..40648c2573908dd743d1b5708f0bf1b839c6c4ec 100644
+--- a/src/linked/torch/metax/ops/rms_norm/vllm.yaml
++++ b/src/linked/torch/metax/ops/rms_norm/vllm.yaml
+@@ -1,3 +1,3 @@
+-library: vllm
++library: mcoplib
+ required_symbols:
+   - rms_norm(at::Tensor&, at::Tensor&, at::Tensor&, double)
+diff --git a/src/linked/torch/metax/ops/silu_and_mul/vllm.yaml b/src/linked/torch/metax/ops/silu_and_mul/vllm.yaml
+index 56fafbd6e1d16eb9f26f3c772c84244bb49b07a1..dd2d6616d287bfda2de965ea8f6d3847d60d57a5 100644
+--- a/src/linked/torch/metax/ops/silu_and_mul/vllm.yaml
++++ b/src/linked/torch/metax/ops/silu_and_mul/vllm.yaml
+@@ -1,3 +1,3 @@
+-library: vllm
++library: mcoplib
+ required_symbols:
+   - silu_and_mul(at::Tensor&, at::Tensor&)
+diff --git a/src/linked/torch/metax/ops/topk_sigmoid/vllm.cc b/src/linked/torch/metax/ops/topk_sigmoid/vllm.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb8aaa1dff37ba6426ad18407c005a4b455e27ad
+--- /dev/null
++++ b/src/linked/torch/metax/ops/topk_sigmoid/vllm.cc
+@@ -0,0 +1,50 @@
++#include "linked/torch/metax/ops/topk_sigmoid/vllm.h"
++
++#include <ATen/core/dispatch/Dispatcher.h>
++#include <ATen/core/stack.h>
++#include <c10/util/Exception.h>
++
++#include <utility>
++
++namespace infini::ops::linked::torch::metax {
++
++void VllmTopkSigmoid::Validate(bool has_is_padding,
++                               double routed_scaling_factor) {
++  TORCH_CHECK(!has_is_padding,
++              "Linked `topk_sigmoid` does not support `is_padding`.");
++  TORCH_CHECK(routed_scaling_factor == 1.0,
++              "Linked `topk_sigmoid` requires "
++              "`routed_scaling_factor == 1.0`.");
++}
++
++void VllmTopkSigmoid::Call(at::Tensor topk_weights, at::Tensor topk_indices,
++                           at::Tensor token_expert_indices,
++                           at::Tensor gating_output, bool renormalize,
++                           std::optional<at::Tensor> bias) {
++  static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
++      "_moe_C::topk_sigmoid", "");
++  c10::Stack stack;
++  stack.emplace_back(std::move(topk_weights));
++  stack.emplace_back(std::move(topk_indices));
++  stack.emplace_back(std::move(token_expert_indices));
++  stack.emplace_back(std::move(gating_output));
++  stack.emplace_back(renormalize);
++  if (bias.has_value()) {
++    stack.emplace_back(std::move(*bias));
++  } else {
++    stack.emplace_back();
++  }
++  op.callBoxed(&stack);
++
++  TORCH_CHECK(stack.empty(),
++              "Linked `topk_sigmoid` returned unexpected values.");
++}
++
++}  // namespace infini::ops::linked::torch::metax
++
++namespace infini::ops::linked::torch {
++
++template class TorchTopkSigmoid<
++    ::infini::ops::linked::torch::metax::VllmTopkSigmoid>;
++
++}  // namespace infini::ops::linked::torch
+diff --git a/src/linked/torch/metax/ops/topk_sigmoid/vllm.h b/src/linked/torch/metax/ops/topk_sigmoid/vllm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..42705a4ad81d96ff13ef4ead1cf64c32caa43cb6
+--- /dev/null
++++ b/src/linked/torch/metax/ops/topk_sigmoid/vllm.h
+@@ -0,0 +1,43 @@
++#ifndef INFINI_OPS_LINKED_TORCH_METAX_OPS_TOPK_SIGMOID_VLLM_H_
++#define INFINI_OPS_LINKED_TORCH_METAX_OPS_TOPK_SIGMOID_VLLM_H_
++
++#include <optional>
++
++#include "linked/torch/ops/topk_sigmoid.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct VllmTopkSigmoid : C10<Device::Type::kMetax> {
++  static void Validate(bool has_is_padding, double routed_scaling_factor);
++
++  static void Call(at::Tensor topk_weights, at::Tensor topk_indices,
++                   at::Tensor token_expert_indices, at::Tensor gating_output,
++                   bool renormalize, std::optional<at::Tensor> bias);
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
++namespace infini::ops::linked::torch {
++
++extern template class TorchTopkSigmoid<
++    ::infini::ops::linked::torch::metax::VllmTopkSigmoid>;
++
++}  // namespace infini::ops::linked::torch
++
++namespace infini::ops {
++
++template <>
++class Operator<TopkSigmoid, Device::Type::kMetax, 16>
++    : public linked::torch::TorchTopkSigmoid<
++          linked::torch::metax::VllmTopkSigmoid> {
++ public:
++  using linked::torch::TorchTopkSigmoid<
++      linked::torch::metax::VllmTopkSigmoid>::TorchTopkSigmoid;
++  using linked::torch::TorchTopkSigmoid<
++      linked::torch::metax::VllmTopkSigmoid>::operator();
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_LINKED_TORCH_METAX_OPS_TOPK_SIGMOID_VLLM_H_
+diff --git a/src/linked/torch/metax/ops/topk_sigmoid/vllm.yaml b/src/linked/torch/metax/ops/topk_sigmoid/vllm.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..70d5f22c63fea5df7569ac65cbe08453ce274da7
+--- /dev/null
++++ b/src/linked/torch/metax/ops/topk_sigmoid/vllm.yaml
+@@ -0,0 +1,6 @@
++library: mcoplib_moe
++operator_schema: >-
++  _moe_C::topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices,
++  Tensor! token_expert_indices, Tensor gating_output, bool renormalize,
++  Tensor? bias) -> ()
++dispatch_key: CUDA
+diff --git a/src/linked/torch/metax/vllm.yaml.disabled b/src/linked/torch/metax/vllm.yaml.disabled
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f9882f2712d3cf7db617c09fca5540ccd178920
+--- /dev/null
++++ b/src/linked/torch/metax/vllm.yaml.disabled
+@@ -0,0 +1,2 @@
++python_distribution_package: vllm
++library_glob: vllm/_C*.so
+diff --git a/src/linked/torch/ops/layer_norm.h b/src/linked/torch/ops/layer_norm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb28b93afc875aa44df59d2355a19925afa1ec98
+--- /dev/null
++++ b/src/linked/torch/ops/layer_norm.h
+@@ -0,0 +1,75 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_LAYER_NORM_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_LAYER_NORM_H_
++
++#include <optional>
++#include <vector>
++
++#include "base/layer_norm.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++class TorchLayerNorm : public ::infini::ops::LayerNorm {
++ public:
++  TorchLayerNorm(const Tensor input, const Tensor weight,
++                 const std::optional<Tensor> bias, float eps, Tensor out)
++      : ::infini::ops::LayerNorm{input, weight, bias, eps, out},
++        input_shape_{input.shape()},
++        input_strides_{input.strides()},
++        weight_shape_{weight.shape()},
++        weight_strides_{weight.strides()},
++        out_shape_{out.shape()},
++        out_strides_{out.strides()},
++        input_type_{input.dtype()},
++        weight_type_{weight.dtype()},
++        out_type_{out.dtype()},
++        device_index_{out.device().index()} {}
++
++  using ::infini::ops::LayerNorm::operator();
++
++  void operator()(const Tensor input, const Tensor weight,
++                  const std::optional<Tensor> bias, float eps,
++                  Tensor out) const override {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_input = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(input.data()), input_shape_, input_strides_,
++        input_type_, device_index_);
++    auto at_out = ToAtenTensor<Backend::kDeviceType>(
++        out.data(), out_shape_, out_strides_, out_type_, device_index_);
++    auto at_weight = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(weight.data()), weight_shape_, weight_strides_,
++        weight_type_, device_index_);
++    c10::optional<at::Tensor> at_bias;
++    if (bias.has_value()) {
++      at_bias = c10::optional<at::Tensor>{ToAtenTensor<Backend::kDeviceType>(
++          const_cast<void*>(bias->data()), bias->shape(), bias->strides(),
++          bias->dtype(), device_index_)};
++    }
++
++    // Inference LayerNorm: only the normalized output is
++    // needed; the mean and rstd outputs are discarded.
++    std::vector<int64_t> normalized_shape{at_input.sizes().back()};
++    auto result =
++        at::native_layer_norm(at_input, at::IntArrayRef(normalized_shape),
++                              at_weight, at_bias, static_cast<double>(eps));
++    at_out.copy_(std::get<0>(result));
++  }
++
++ private:
++  Tensor::Shape input_shape_;
++  Tensor::Strides input_strides_;
++  Tensor::Shape weight_shape_;
++  Tensor::Strides weight_strides_;
++  Tensor::Shape out_shape_;
++  Tensor::Strides out_strides_;
++  DataType input_type_;
++  DataType weight_type_;
++  DataType out_type_;
++  int device_index_{0};
++};
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_LAYER_NORM_H_
+diff --git a/src/linked/torch/ops/moe_align_block_size.h b/src/linked/torch/ops/moe_align_block_size.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6e705f0ae8dcc0514413f6e820d0c41f7657816
+--- /dev/null
++++ b/src/linked/torch/ops/moe_align_block_size.h
+@@ -0,0 +1,70 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_MOE_ALIGN_BLOCK_SIZE_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_MOE_ALIGN_BLOCK_SIZE_H_
++
++#include <optional>
++
++#include "base/moe_align_block_size.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++class TorchMoeAlignBlockSize : public ::infini::ops::MoeAlignBlockSize {
++ public:
++  TorchMoeAlignBlockSize(const Tensor topk_ids,
++                         const std::optional<Tensor> expert_map,
++                         const int64_t num_experts, const int64_t block_size,
++                         Tensor sorted_token_ids, Tensor experts_ids,
++                         Tensor num_tokens_post_pad)
++      : ::infini::ops::MoeAlignBlockSize{topk_ids,           expert_map,
++                                         num_experts,        block_size,
++                                         sorted_token_ids,   experts_ids,
++                                         num_tokens_post_pad},
++        device_index_{topk_ids.device().index()} {}
++
++  using ::infini::ops::MoeAlignBlockSize::operator();
++
++  void Run(const Tensor topk_ids, const std::optional<Tensor> expert_map,
++           const int64_t num_experts, const int64_t block_size,
++           Tensor sorted_token_ids, Tensor experts_ids,
++           Tensor num_tokens_post_pad) const override {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++
++    auto at_topk_ids = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(topk_ids.data()), topk_ids_metadata_.shape(),
++        topk_ids_metadata_.strides(), topk_ids_metadata_.dtype(),
++        device_index_);
++    auto at_sorted_token_ids = ToAtenTensor<Backend::kDeviceType>(
++        sorted_token_ids.data(), sorted_token_ids_metadata_.shape(),
++        sorted_token_ids_metadata_.strides(),
++        sorted_token_ids_metadata_.dtype(), device_index_);
++    auto at_experts_ids = ToAtenTensor<Backend::kDeviceType>(
++        experts_ids.data(), experts_ids_metadata_.shape(),
++        experts_ids_metadata_.strides(), experts_ids_metadata_.dtype(),
++        device_index_);
++    auto at_num_tokens_post_pad = ToAtenTensor<Backend::kDeviceType>(
++        num_tokens_post_pad.data(), num_tokens_post_pad_metadata_.shape(),
++        num_tokens_post_pad_metadata_.strides(),
++        num_tokens_post_pad_metadata_.dtype(), device_index_);
++    std::optional<at::Tensor> at_expert_map;
++    if (expert_map.has_value()) {
++      at_expert_map.emplace(ToAtenTensor<Backend::kDeviceType>(
++          const_cast<void*>(expert_map->data()), expert_map_metadata_->shape(),
++          expert_map_metadata_->strides(), expert_map_metadata_->dtype(),
++          device_index_));
++    }
++
++    Backend::Call(std::move(at_topk_ids), static_cast<int64_t>(num_experts_),
++                  static_cast<int64_t>(block_size_),
++                  std::move(at_sorted_token_ids), std::move(at_experts_ids),
++                  std::move(at_num_tokens_post_pad), std::move(at_expert_map));
++  }
++
++ private:
++  int device_index_{0};
++};
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_MOE_ALIGN_BLOCK_SIZE_H_
+diff --git a/src/linked/torch/ops/pad.h b/src/linked/torch/ops/pad.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..893eb06d6e3436be671f86220c900d830695de44
+--- /dev/null
++++ b/src/linked/torch/ops/pad.h
+@@ -0,0 +1,56 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_PAD_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_PAD_H_
++
++#include <optional>
++#include <vector>
++
++#include "base/pad.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++class TorchPad : public ::infini::ops::Pad {
++ public:
++  TorchPad(const Tensor input, const std::vector<int64_t> pad,
++           const std::string mode, const std::optional<double> value,
++           Tensor out)
++      : ::infini::ops::Pad{input, pad, mode, value, out},
++        input_shape_{input.shape()},
++        input_strides_{input.strides()},
++        out_shape_{out.shape()},
++        out_strides_{out.strides()},
++        input_type_{input.dtype()},
++        out_type_{out.dtype()},
++        device_index_{out.device().index()} {}
++
++  using ::infini::ops::Pad::operator();
++
++  void operator()(const Tensor input, const std::vector<int64_t> pad,
++                  const std::string mode, const std::optional<double> value,
++                  Tensor out) const override {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_input = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(input.data()), input_shape_, input_strides_,
++        input_type_, device_index_);
++    auto at_out = ToAtenTensor<Backend::kDeviceType>(
++        out.data(), out_shape_, out_strides_, out_type_, device_index_);
++    (void)mode;
++    Backend::Call(std::move(at_out), std::move(at_input), pad,
++                  value.value_or(0.0));
++  }
++
++ private:
++  Tensor::Shape input_shape_;
++  Tensor::Strides input_strides_;
++  Tensor::Shape out_shape_;
++  Tensor::Strides out_strides_;
++  DataType input_type_;
++  DataType out_type_;
++  int device_index_{0};
++};
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_PAD_H_
+diff --git a/src/linked/torch/ops/quick_gelu.h b/src/linked/torch/ops/quick_gelu.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a2c88de359d8e1b9b568ccba79c4e337d59c9e6
+--- /dev/null
++++ b/src/linked/torch/ops/quick_gelu.h
+@@ -0,0 +1,59 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_QUICK_GELU_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_QUICK_GELU_H_
++
++#include "base/quick_gelu.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++class TorchQuickGelu : public ::infini::ops::QuickGelu {
++ public:
++  TorchQuickGelu(const Tensor input, Tensor out)
++      : ::infini::ops::QuickGelu{input, out},
++        input_shape_{input.shape()},
++        input_strides_{input.strides()},
++        out_shape_{out.shape()},
++        out_strides_{out.strides()},
++        input_type_{input.dtype()},
++        out_type_{out.dtype()},
++        device_index_{out.device().index()} {}
++
++  using ::infini::ops::QuickGelu::operator();
++
++  void operator()(const Tensor input, Tensor out) const override {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_input = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(input.data()), input_shape_, input_strides_,
++        input_type_, device_index_);
++    auto at_out = ToAtenTensor<Backend::kDeviceType>(
++        out.data(), out_shape_, out_strides_, out_type_, device_index_);
++
++    auto backend_input =
++        is_input_contiguous_ ? at_input : at_input.contiguous();
++    auto backend_out = is_out_contiguous_
++                           ? at_out
++                           : at::empty(at_out.sizes(), at_out.options());
++
++    Backend::Call(backend_out, backend_input);
++    if (!is_out_contiguous_) {
++      at_out.copy_(backend_out);
++    }
++  }
++
++ private:
++  Tensor::Shape input_shape_;
++  Tensor::Strides input_strides_;
++  Tensor::Shape out_shape_;
++  Tensor::Strides out_strides_;
++  DataType input_type_;
++  DataType out_type_;
++  bool is_input_contiguous_{false};
++  bool is_out_contiguous_{false};
++  int device_index_{0};
++};
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_QUICK_GELU_H_
+diff --git a/src/native/cuda/metax/ops/causal_conv1d/kernel.h b/src/native/cuda/metax/ops/causal_conv1d/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b0e069a660f6db61352f2c6974aa700f8658fce
+--- /dev/null
++++ b/src/native/cuda/metax/ops/causal_conv1d/kernel.h
+@@ -0,0 +1,196 @@
++#ifndef INFINI_OPS_METAX_CAUSAL_CONV1D_KERNEL_H_
++#define INFINI_OPS_METAX_CAUSAL_CONV1D_KERNEL_H_
++
++#include <climits>
++#include <stdexcept>
++
++#include "base/causal_conv1d.h"
++#include "native/cuda/metax/runtime_.h"
++// cuda_fp16.h / cuda_bf16.h come from the MACA cu-bridge,
++// where __nv_bfloat16 aliases __maca_bfloat16.
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++namespace infini::ops {
++namespace metax_causal_conv1d_detail {
++struct Layout {
++  ptrdiff_t strides[9][3]{};
++  size_t tokens, channels, pool;
++  bool cu_i64, initial_i64, final_i64;
++};
++__device__ inline int64_t index(const void* p, bool i64, int i, int fallback) {
++  return p ? (i64 ? static_cast<const int64_t*>(p)[i]
++                  : static_cast<int64_t>(static_cast<const int32_t*>(p)[i]))
++           : fallback;
++}
++template <typename T>
++__device__ inline float history(const T* state, const T* qkv, int64_t pos,
++                                int64_t begin, int batch, int channel,
++                                ptrdiff_t base, const Layout& p) {
++  if (pos < 3) return static_cast<float>(state[base + pos * p.strides[2][2]]);
++  const auto off = static_cast<ptrdiff_t>(batch) * p.strides[0][0] +
++                   static_cast<ptrdiff_t>(begin + pos - 3) * p.strides[0][1] +
++                   static_cast<ptrdiff_t>(channel) * p.strides[0][2];
++  return static_cast<float>(qkv[off]);
++}
++// Port of baseline InfiniCore-0.2.9 causal_conv1d_k4_kernel. One thread per
++// request/channel reads the entire sequence before committing its final state.
++template <typename T>
++__global__ void kernel(const T* qkv, const T* weight, T* state, const T* bias,
++                       const void* cu, const void* initial,
++                       const void* final_indices, T* out, T* final_state,
++                       Layout p) {
++  const int request = blockIdx.x, channel = blockIdx.y;
++  if (static_cast<size_t>(channel) >= p.channels || threadIdx.x != 0) return;
++  int64_t begin = 0, end = static_cast<int64_t>(p.tokens);
++  int batch = request;
++  if (cu) {
++    begin = index(cu, p.cu_i64, request, 0);
++    end = index(cu, p.cu_i64, request + 1, 0);
++    batch = 0;
++    // Preserve baseline device-value behavior: malformed range leaves the
++    // corresponding output/state untouched. This is not host validation.
++    if (begin < 0 || end < begin || end > static_cast<int64_t>(p.tokens))
++      return;
++  }
++  const int64_t length = end - begin;
++  const int64_t read = index(initial, p.initial_i64, request, request);
++  const int64_t write = index(final_indices, p.final_i64, request, request);
++  if (read < 0 || write < 0 || read >= static_cast<int64_t>(p.pool) ||
++      (final_indices && write >= static_cast<int64_t>(p.pool)))
++    return;
++  const auto base = static_cast<ptrdiff_t>(read) * p.strides[2][0] +
++                    static_cast<ptrdiff_t>(channel) * p.strides[2][1];
++  const auto wb = static_cast<ptrdiff_t>(channel) * p.strides[1][0];
++  for (int64_t t = 0; t < length; ++t) {
++    float acc = static_cast<float>(weight[wb]) *
++                    history(state, qkv, t, begin, batch, channel, base, p) +
++                static_cast<float>(weight[wb + p.strides[1][2]]) *
++                    history(state, qkv, t + 1, begin, batch, channel, base, p) +
++                static_cast<float>(weight[wb + 2 * p.strides[1][2]]) *
++                    history(state, qkv, t + 2, begin, batch, channel, base, p) +
++                static_cast<float>(weight[wb + 3 * p.strides[1][2]]) *
++                    history(state, qkv, t + 3, begin, batch, channel, base, p);
++    if (bias)
++      acc += static_cast<float>(
++          bias[static_cast<ptrdiff_t>(channel) * p.strides[3][0]]);
++    const auto off = static_cast<ptrdiff_t>(batch) * p.strides[7][0] +
++                     static_cast<ptrdiff_t>(begin + t) * p.strides[7][1] +
++                     static_cast<ptrdiff_t>(channel) * p.strides[7][2];
++    out[off] = static_cast<T>(acc);
++  }
++  T* target = final_indices ? state : final_state;
++  const int stride_index = final_indices ? 2 : 8;
++  const auto target_base =
++      static_cast<ptrdiff_t>(final_indices ? write : request) *
++          p.strides[stride_index][0] +
++      static_cast<ptrdiff_t>(channel) * p.strides[stride_index][1];
++  // Same ordered commit as baseline. Exact initial/final alias is valid for
++  // short sequences because copied history source positions lie ahead of
++  // writes.
++  target[target_base] = static_cast<T>(
++      history(state, qkv, length, begin, batch, channel, base, p));
++  target[target_base + p.strides[stride_index][2]] = static_cast<T>(
++      history(state, qkv, length + 1, begin, batch, channel, base, p));
++  target[target_base + 2 * p.strides[stride_index][2]] = static_cast<T>(
++      history(state, qkv, length + 2, begin, batch, channel, base, p));
++}
++}  // namespace metax_causal_conv1d_detail
++
++template <>
++class Operator<CausalConv1d, Device::Type::kMetax> : public CausalConv1d {
++ public:
++  using CausalConv1d::CausalConv1d;
++  using CausalConv1d::operator();
++
++  Operator(const Tensor qkv, const Tensor weight, Tensor conv_state,
++           const std::optional<Tensor> bias,
++           const std::optional<Tensor> cu_seqlens,
++           const std::optional<Tensor> initial_state_indices,
++           const std::optional<Tensor> final_state_indices, Tensor out,
++           std::optional<Tensor> final_conv_state)
++      : CausalConv1d(qkv, weight, conv_state, bias, cu_seqlens,
++                     initial_state_indices, final_state_indices, out,
++                     final_conv_state) {
++    if (weight.shape()[2] != 4 || conv_state.shape()[2] != 3)
++      throw std::invalid_argument(
++          "MetaX causal conv kernel requires K4 and state_len3");
++    if (tokens_ > static_cast<size_t>(std::numeric_limits<int64_t>::max() - 3))
++      throw std::overflow_error(
++          "MetaX causal conv history index exceeds int64");
++    if (requests_ >= static_cast<size_t>(INT_MAX) || channels_ > 65535)
++      throw std::invalid_argument(
++          "causal conv request/channel launch extent unsupported");
++    p_.tokens = tokens_;
++    p_.channels = channels_;
++    p_.pool = pool_;
++    for (size_t i = 0; i < metadata_.size(); ++i)
++      if (metadata_[i])
++        for (size_t j = 0; j < metadata_[i]->strides().size(); ++j)
++          p_.strides[i][j] = metadata_[i]->strides()[j];
++    p_.cu_i64 = metadata_[4] && metadata_[4]->dtype() == DataType::kInt64;
++    p_.initial_i64 = metadata_[5] && metadata_[5]->dtype() == DataType::kInt64;
++    p_.final_i64 = metadata_[6] && metadata_[6]->dtype() == DataType::kInt64;
++  }
++
++  void operator()(const Tensor qkv, const Tensor weight, Tensor conv_state,
++                  const std::optional<Tensor> bias,
++                  const std::optional<Tensor> cu_seqlens,
++                  const std::optional<Tensor> initial_state_indices,
++                  const std::optional<Tensor> final_state_indices, Tensor out,
++                  std::optional<Tensor> final_conv_state) const override {
++    const Views views{qkv,
++                      weight,
++                      conv_state,
++                      bias,
++                      cu_seqlens,
++                      initial_state_indices,
++                      final_state_indices,
++                      out,
++                      final_conv_state};
++    for (size_t i = 0; i < views.size(); ++i) {
++      const auto& t = views[i];
++      if (t.has_value() != metadata_[i].has_value() ||
++          (t && (!std::equal_to<Tensor>{}(*t, *metadata_[i]) ||
++                 (t->numel() && !t->data()))))
++        throw std::invalid_argument(
++            "causal conv metadata changed or nonempty storage is null");
++    }
++    if (!requests_ || !channels_) return;
++    switch (dtype_) {
++      case DataType::kFloat32:
++        launch<float>(views);
++        break;
++      case DataType::kFloat16:
++        launch<half>(views);
++        break;
++      case DataType::kBFloat16:
++        launch<__nv_bfloat16>(views);
++        break;
++      default:
++        throw std::invalid_argument("causal conv dtype unsupported");
++    }
++  }
++
++ private:
++  metax_causal_conv1d_detail::Layout p_{};
++  template <typename T>
++  void launch(const Views& v) const {
++    auto pointer = [&](size_t i) -> void* {
++      return v[i] ? const_cast<void*>(v[i]->data()) : nullptr;
++    };
++    const dim3 grid(static_cast<unsigned int>(requests_),
++                    static_cast<unsigned int>(channels_), 1);
++    const auto stream =
++        static_cast<typename Runtime<Device::Type::kMetax>::Stream>(
++            stream_ ? stream_ : nullptr);
++    metax_causal_conv1d_detail::kernel<T><<<grid, 1, 0, stream>>>(
++        static_cast<const T*>(pointer(0)), static_cast<const T*>(pointer(1)),
++        static_cast<T*>(pointer(2)), static_cast<const T*>(pointer(3)),
++        pointer(4), pointer(5), pointer(6), static_cast<T*>(pointer(7)),
++        static_cast<T*>(pointer(8)), p_);
++  }
++};
++}  // namespace infini::ops
++
++#endif
+diff --git a/src/native/cuda/metax/ops/chunk_gated_delta_rule/chunk_gated_delta_rule_legacy_kernel.cuh b/src/native/cuda/metax/ops/chunk_gated_delta_rule/chunk_gated_delta_rule_legacy_kernel.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ec06e8d6154108652d95629332ec17b06b7ef2d
+--- /dev/null
++++ b/src/native/cuda/metax/ops/chunk_gated_delta_rule/chunk_gated_delta_rule_legacy_kernel.cuh
+@@ -0,0 +1,261 @@
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++// Ported from InfiniCore 1ab85ef1d3c2bce49edf1fc73a5b48becaf7552e:
++// src/infiniop/ops/chunk_gated_delta_rule/cuda/kernel.cuh.
++// Modified for InfiniOps: active helpers/state kernel and namespace adaptation.
++// Copyright 2025 InfiniTensor; MIT notice: LICENSES/InfiniCore-MIT.txt.
++#pragma once
++#include <cstdint>
++// Exact baseline helpers and active state-workspace kernel. The baseline
++// chunked-matrix branch is hard-disabled and is not copied as a second path.
++namespace infini::ops::chunk_native_detail {
++__device__ inline int64_t loadOptionalIndex(const void* indices, bool is_i64,
++                                            int idx, int fallback) {
++  if (indices == nullptr) {
++    return static_cast<int64_t>(fallback);
++  }
++  return is_i64
++             ? static_cast<const int64_t*>(indices)[idx]
++             : static_cast<int64_t>(static_cast<const int32_t*>(indices)[idx]);
++}
++
++template <typename T>
++__device__ inline float loadAsFloat(const T* ptr, ptrdiff_t offset) {
++  return static_cast<float>(ptr[offset]);
++}
++
++template <>
++__device__ inline float loadAsFloat<half>(const half* ptr, ptrdiff_t offset) {
++  return __half2float(ptr[offset]);
++}
++
++template <>
++__device__ inline float loadAsFloat<__nv_bfloat16>(const __nv_bfloat16* ptr,
++                                                   ptrdiff_t offset) {
++  return __bfloat162float(ptr[offset]);
++}
++
++#define CGDR_FOR(idx, n) \
++  for (int idx = threadIdx.x; idx < static_cast<int>(n); idx += blockDim.x)
++
++template <typename Tcompute, int NUM_THREADS>
++__device__ Tcompute blockReduceSum(Tcompute v) {
++  __shared__ Tcompute smem[NUM_THREADS];
++  smem[threadIdx.x] = v;
++  __syncthreads();
++
++  for (int s = NUM_THREADS / 2; s > 0; s >>= 1) {
++    if (threadIdx.x < s) {
++      smem[threadIdx.x] += smem[threadIdx.x + s];
++    }
++    __syncthreads();
++  }
++  return smem[0];
++}
++
++template <typename Tdata, typename Tgate, typename Tcompute, size_t Dk,
++          size_t Dv, size_t NUM_THREADS>
++__device__ void chunkGatedDeltaRuleRecurrentKernel(
++    Tcompute* state_workspace, Tdata* out, Tdata* initial_state,
++    Tdata* final_state, const Tdata* q, const Tdata* k, const Tdata* v,
++    const Tgate* g, const Tgate* beta, const void* cu_seqlens,
++    const void* initial_state_indices, const void* final_state_indices,
++    bool cu_seqlens_i64, bool initial_state_indices_i64,
++    bool final_state_indices_i64, bool use_qk_l2norm, bool has_cu_seqlens,
++    bool indexed_state_pool, size_t T, size_t pool_size, size_t Hk,
++    size_t value_heads_per_key_head, ptrdiff_t out_s0, ptrdiff_t out_s1,
++    ptrdiff_t out_s2, ptrdiff_t initial_s0, ptrdiff_t initial_s1,
++    ptrdiff_t initial_s2, ptrdiff_t initial_s3, ptrdiff_t final_s0,
++    ptrdiff_t final_s1, ptrdiff_t final_s2, ptrdiff_t final_s3, ptrdiff_t q_s0,
++    ptrdiff_t q_s1, ptrdiff_t q_s2, ptrdiff_t k_s0, ptrdiff_t k_s1,
++    ptrdiff_t k_s2, ptrdiff_t v_s0, ptrdiff_t v_s1, ptrdiff_t v_s2,
++    ptrdiff_t g_s0, ptrdiff_t g_s1, ptrdiff_t g_s2, ptrdiff_t beta_s0,
++    ptrdiff_t beta_s1, ptrdiff_t beta_s2) {
++  const int batch_idx = blockIdx.x;
++  const int value_head_idx = blockIdx.y;
++  const int key_head_idx =
++      value_head_idx / static_cast<int>(value_heads_per_key_head);
++
++  if (key_head_idx >= static_cast<int>(Hk)) {
++    return;
++  }
++
++  int64_t token_begin = 0;
++  int64_t token_end = static_cast<int64_t>(T);
++
++  if (has_cu_seqlens) {
++    token_begin = loadOptionalIndex(cu_seqlens, cu_seqlens_i64, batch_idx, 0);
++    token_end = loadOptionalIndex(cu_seqlens, cu_seqlens_i64, batch_idx + 1, 0);
++    if (token_begin < 0 || token_end < token_begin ||
++        token_end > static_cast<int64_t>(T)) {
++      return;
++    }
++  }
++
++  int64_t read_slot = batch_idx;
++  int64_t write_slot = batch_idx;
++
++  if (indexed_state_pool) {
++    read_slot = loadOptionalIndex(
++        initial_state_indices, initial_state_indices_i64, batch_idx, batch_idx);
++
++    write_slot =
++        final_state_indices == nullptr
++            ? static_cast<int64_t>(batch_idx)
++            : loadOptionalIndex(final_state_indices, final_state_indices_i64,
++                                batch_idx, batch_idx);
++
++    if (read_slot < 0 || read_slot >= static_cast<int64_t>(pool_size) ||
++        (final_state_indices != nullptr &&
++         (write_slot < 0 || write_slot >= static_cast<int64_t>(pool_size)))) {
++      return;
++    }
++  }
++
++  const ptrdiff_t initial_base =
++      indexed_state_pool
++          ? static_cast<ptrdiff_t>(read_slot) * initial_s0 +
++                static_cast<ptrdiff_t>(value_head_idx) * initial_s1
++          : static_cast<ptrdiff_t>(batch_idx) * initial_s0 +
++                static_cast<ptrdiff_t>(value_head_idx) * initial_s1;
++
++  Tdata* final_state_target = nullptr;
++  ptrdiff_t final_base = 0;
++
++  if (indexed_state_pool && final_state_indices != nullptr) {
++    final_state_target = initial_state;
++    final_base = static_cast<ptrdiff_t>(write_slot) * initial_s0 +
++                 static_cast<ptrdiff_t>(value_head_idx) * initial_s1;
++  } else {
++    final_state_target = final_state;
++    final_base = static_cast<ptrdiff_t>(batch_idx) * final_s0 +
++                 static_cast<ptrdiff_t>(value_head_idx) * final_s1;
++  }
++
++  const ptrdiff_t workspace_block =
++      (static_cast<ptrdiff_t>(batch_idx) * gridDim.y +
++       static_cast<ptrdiff_t>(value_head_idx)) *
++      static_cast<ptrdiff_t>(Dk * Dv);
++
++  Tcompute* state_local = state_workspace + workspace_block;
++  __shared__ Tcompute q_vec[Dk];
++  __shared__ Tcompute k_vec[Dk];
++  __shared__ Tcompute v_new[Dv];
++  __shared__ Tcompute scalar_buf[3];
++
++  const int token_batch = has_cu_seqlens ? 0 : batch_idx;
++  const Tcompute scale = rsqrtf(static_cast<Tcompute>(Dk));
++
++  CGDR_FOR(i, Dk * Dv) {
++    int dk = i / Dv;
++    int dv = i % Dv;
++
++    ptrdiff_t read_idx = initial_base +
++                         static_cast<ptrdiff_t>(dv) * initial_s2 +
++                         static_cast<ptrdiff_t>(dk) * initial_s3;
++
++    state_local[i] =
++        static_cast<Tcompute>(loadAsFloat(initial_state, read_idx));
++  }
++  __syncthreads();
++
++  for (int64_t token_idx = token_begin; token_idx < token_end; ++token_idx) {
++    ptrdiff_t q_base = static_cast<ptrdiff_t>(token_batch) * q_s0 +
++                       static_cast<ptrdiff_t>(token_idx) * q_s1 +
++                       static_cast<ptrdiff_t>(key_head_idx) * q_s2;
++    ptrdiff_t k_base = static_cast<ptrdiff_t>(token_batch) * k_s0 +
++                       static_cast<ptrdiff_t>(token_idx) * k_s1 +
++                       static_cast<ptrdiff_t>(key_head_idx) * k_s2;
++
++    Tcompute q_sum = 0;
++    Tcompute k_sum = 0;
++    for (int dk = threadIdx.x; dk < static_cast<int>(Dk); dk += blockDim.x) {
++      Tcompute q_raw = static_cast<Tcompute>(loadAsFloat(q, q_base + dk));
++      Tcompute k_raw = static_cast<Tcompute>(loadAsFloat(k, k_base + dk));
++      q_vec[dk] = q_raw;
++      k_vec[dk] = k_raw;
++      q_sum += q_raw * q_raw;
++      k_sum += k_raw * k_raw;
++    }
++
++    q_sum = blockReduceSum<Tcompute, NUM_THREADS>(q_sum);
++    k_sum = blockReduceSum<Tcompute, NUM_THREADS>(k_sum);
++
++    if (threadIdx.x == 0) {
++      ptrdiff_t gate_offset = static_cast<ptrdiff_t>(token_batch) * g_s0 +
++                              static_cast<ptrdiff_t>(token_idx) * g_s1 +
++                              static_cast<ptrdiff_t>(value_head_idx) * g_s2;
++      ptrdiff_t beta_offset = static_cast<ptrdiff_t>(token_batch) * beta_s0 +
++                              static_cast<ptrdiff_t>(token_idx) * beta_s1 +
++                              static_cast<ptrdiff_t>(value_head_idx) * beta_s2;
++
++      scalar_buf[0] = expf(static_cast<Tcompute>(loadAsFloat(g, gate_offset)));
++      scalar_buf[1] = static_cast<Tcompute>(loadAsFloat(beta, beta_offset));
++      scalar_buf[2] = use_qk_l2norm
++                          ? rsqrtf(q_sum + static_cast<Tcompute>(1e-6)) * scale
++                          : scale;
++    }
++    __syncthreads();
++
++    const Tcompute decay = scalar_buf[0];
++    const Tcompute beta_t = scalar_buf[1];
++    const Tcompute q_scale = scalar_buf[2];
++    const Tcompute k_scale = use_qk_l2norm
++                                 ? rsqrtf(k_sum + static_cast<Tcompute>(1e-6))
++                                 : static_cast<Tcompute>(1);
++
++    for (int dk = threadIdx.x; dk < static_cast<int>(Dk); dk += blockDim.x) {
++      q_vec[dk] *= q_scale;
++      k_vec[dk] *= k_scale;
++    }
++    __syncthreads();
++
++    for (int dv = threadIdx.x; dv < static_cast<int>(Dv); dv += blockDim.x) {
++      Tcompute projected = 0;
++      for (int dk = 0; dk < static_cast<int>(Dk); ++dk) {
++        projected += k_vec[dk] * state_local[dk * Dv + dv];
++      }
++
++      ptrdiff_t v_base = static_cast<ptrdiff_t>(token_batch) * v_s0 +
++                         static_cast<ptrdiff_t>(token_idx) * v_s1 +
++                         static_cast<ptrdiff_t>(value_head_idx) * v_s2;
++      Tcompute v_raw = static_cast<Tcompute>(loadAsFloat(v, v_base + dv));
++      v_new[dv] = beta_t * (v_raw - decay * projected);
++    }
++    __syncthreads();
++
++    CGDR_FOR(x, Dk * Dv) {
++      int dk = x / Dv;
++      int dv = x % Dv;
++      state_local[x] = decay * state_local[x] + k_vec[dk] * v_new[dv];
++    }
++    __syncthreads();
++
++    for (int dv = threadIdx.x; dv < static_cast<int>(Dv); dv += blockDim.x) {
++      Tcompute out_val = 0;
++      for (int dk = 0; dk < static_cast<int>(Dk); ++dk) {
++        out_val += q_vec[dk] * state_local[dk * Dv + dv];
++      }
++
++      ptrdiff_t out_base = static_cast<ptrdiff_t>(token_batch) * out_s0 +
++                           static_cast<ptrdiff_t>(token_idx) * out_s1 +
++                           static_cast<ptrdiff_t>(value_head_idx) * out_s2;
++      out[out_base + dv] = static_cast<Tdata>(out_val);
++    }
++    __syncthreads();
++  }
++
++  CGDR_FOR(i, Dk * Dv) {
++    int dk = i / Dv;
++    int dv = i % Dv;
++
++    const ptrdiff_t s2 = final_state_indices != nullptr ? initial_s2 : final_s2;
++    const ptrdiff_t s3 = final_state_indices != nullptr ? initial_s3 : final_s3;
++    ptrdiff_t write_idx = final_base + static_cast<ptrdiff_t>(dv) * s2 +
++                          static_cast<ptrdiff_t>(dk) * s3;
++
++    final_state_target[write_idx] = static_cast<Tdata>(state_local[i]);
++  }
++}
++#undef CGDR_FOR
++}  // namespace infini::ops::chunk_native_detail
+diff --git a/src/native/cuda/metax/ops/chunk_gated_delta_rule/kernel.h b/src/native/cuda/metax/ops/chunk_gated_delta_rule/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb1465bf5646f2498f77d873a0d33e8ba6c06276
+--- /dev/null
++++ b/src/native/cuda/metax/ops/chunk_gated_delta_rule/kernel.h
+@@ -0,0 +1,171 @@
++#ifndef INFINI_OPS_METAX_CHUNK_GATED_DELTA_RULE_KERNEL_H_
++#define INFINI_OPS_METAX_CHUNK_GATED_DELTA_RULE_KERNEL_H_
++
++#include <climits>
++#include <stdexcept>
++
++#include "base/chunk_gated_delta_rule.h"
++#include "chunk_gated_delta_rule_legacy_kernel.cuh"
++#include "native/cuda/metax/runtime_.h"
++// cuda_fp16.h / cuda_bf16.h come from the MACA cu-bridge,
++// where __nv_bfloat16 aliases __maca_bfloat16.
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++namespace infini::ops {
++namespace chunk_native_detail {
++struct Layout {
++  // Rows follow Views: q, k, v, g, beta, initial_state, cu_seqlens,
++  // initial_state_indices, final_state_indices, out, final_state (0..10).
++  // Each row stores that tensor axis strides, up to the four state axes.
++  ptrdiff_t s[11][4]{};
++  bool cu_i64, initial_i64, final_i64, norm, indexed, packed;
++  size_t T, pool, Hk, ratio;
++};
++template <typename Data, typename Gate, size_t D>
++__global__ void kernel(float* workspace, const Data* q, const Data* k,
++                       const Data* v, const Gate* g, const Gate* beta,
++                       Data* state, const void* cu, const void* initial_indices,
++                       const void* final_indices, Data* out, Data* final_state,
++                       Layout p) {
++  // q/k/v/out have a contiguous last axis, so only their first three strides
++  // are passed. Initial/final state uses all axes of [pool,Hv,Dv,Dk].
++  chunkGatedDeltaRuleRecurrentKernel<Data, Gate, float, D, D, D>(
++      workspace, out, state, final_state, q, k, v, g, beta, cu, initial_indices,
++      final_indices, p.cu_i64, p.initial_i64, p.final_i64, p.norm, p.packed,
++      p.indexed, p.T, p.pool, p.Hk, p.ratio, p.s[9][0], p.s[9][1], p.s[9][2],
++      p.s[5][0], p.s[5][1], p.s[5][2], p.s[5][3], p.s[10][0], p.s[10][1],
++      p.s[10][2], p.s[10][3], p.s[0][0], p.s[0][1], p.s[0][2], p.s[1][0],
++      p.s[1][1], p.s[1][2], p.s[2][0], p.s[2][1], p.s[2][2], p.s[3][0],
++      p.s[3][1], p.s[3][2], p.s[4][0], p.s[4][1], p.s[4][2]);
++}
++}  // namespace chunk_native_detail
++
++template <>
++class Operator<ChunkGatedDeltaRule, Device::Type::kMetax>
++    : public ChunkGatedDeltaRule {
++ public:
++  Operator(const Tensor q, const Tensor k, const Tensor v, const Tensor g,
++           const Tensor beta, Tensor initial_state,
++           const std::optional<Tensor> cu_seqlens,
++           const std::optional<Tensor> initial_state_indices,
++           const std::optional<Tensor> final_state_indices, Tensor out,
++           std::optional<Tensor> final_state, bool use_qk_l2norm,
++           size_t chunk_size)
++      : ChunkGatedDeltaRule(q, k, v, g, beta, initial_state, cu_seqlens,
++                            initial_state_indices, final_state_indices, out,
++                            final_state, use_qk_l2norm, chunk_size) {
++    if (v.shape()[3] != D_ || (D_ != 64 && D_ != 128))
++      throw std::invalid_argument(
++          "MetaX chunk delta kernels require Dk=Dv64/128");
++    if (B_ >= static_cast<size_t>(INT_MAX) || Hv_ > 65535 ||
++        Hk_ > static_cast<size_t>(INT_MAX))
++      throw std::invalid_argument("chunk delta launch extent unsupported");
++    const auto maximum = std::numeric_limits<size_t>::max();
++    const size_t per_head = D_ * D_ * sizeof(float);
++    if (B_ > maximum / Hv_ || B_ * Hv_ > maximum / per_head)
++      throw std::overflow_error("chunk delta workspace size overflows");
++    bytes_ = B_ * Hv_ * per_head;
++    if (bytes_ / sizeof(float) >
++        static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()))
++      throw std::overflow_error(
++          "chunk delta workspace element offset exceeds ptrdiff");
++    p_.pool = pool_;
++    p_.Hk = Hk_;
++    p_.ratio = Hv_ / Hk_;
++    p_.norm = norm_;
++    p_.T = T_;
++    p_.packed = metadata_[6].has_value();
++    p_.indexed = metadata_[7].has_value() || metadata_[8].has_value();
++    p_.cu_i64 = metadata_[6] && metadata_[6]->dtype() == DataType::kInt64;
++    p_.initial_i64 = metadata_[7] && metadata_[7]->dtype() == DataType::kInt64;
++    p_.final_i64 = metadata_[8] && metadata_[8]->dtype() == DataType::kInt64;
++    for (size_t i = 0; i < metadata_.size(); ++i)
++      if (metadata_[i])
++        for (size_t j = 0; j < metadata_[i]->strides().size(); ++j)
++          p_.s[i][j] = metadata_[i]->strides()[j];
++  }
++  size_t workspace_size_in_bytes() const override { return bytes_; }
++  void operator()(const Tensor q, const Tensor k, const Tensor v,
++                  const Tensor g, const Tensor beta, Tensor initial_state,
++                  const std::optional<Tensor> cu_seqlens,
++                  const std::optional<Tensor> initial_state_indices,
++                  const std::optional<Tensor> final_state_indices, Tensor out,
++                  std::optional<Tensor> final_state, bool use_qk_l2norm,
++                  size_t chunk_size) const override {
++    const Views views{q,
++                      k,
++                      v,
++                      g,
++                      beta,
++                      initial_state,
++                      cu_seqlens,
++                      initial_state_indices,
++                      final_state_indices,
++                      out,
++                      final_state};
++    CheckInvocation(views, use_qk_l2norm, chunk_size);
++    if (!B_) return;
++    if (!workspace_ || workspace_size_in_bytes_ < bytes_)
++      throw std::invalid_argument("chunk delta workspace missing or too small");
++    switch (data_type_) {
++      case DataType::kFloat16:
++        gate<half>(views);
++        break;
++      case DataType::kBFloat16:
++        gate<__nv_bfloat16>(views);
++        break;
++      case DataType::kFloat32:
++        gate<float>(views);
++        break;
++      default:
++        throw std::invalid_argument("chunk delta data dtype unsupported");
++    }
++  }
++
++ private:
++  size_t bytes_{0};
++  chunk_native_detail::Layout p_{};
++  template <typename Data>
++  void gate(const Views& v) const {
++    switch (gate_type_) {
++      case DataType::kFloat16:
++        dimension<Data, half>(v);
++        break;
++      case DataType::kBFloat16:
++        dimension<Data, __nv_bfloat16>(v);
++        break;
++      case DataType::kFloat32:
++        dimension<Data, float>(v);
++        break;
++      default:
++        throw std::invalid_argument("chunk delta gate dtype unsupported");
++    }
++  }
++  template <typename Data, typename Gate>
++  void dimension(const Views& v) const {
++    if (D_ == 64)
++      launch<Data, Gate, 64>(v);
++    else
++      launch<Data, Gate, 128>(v);
++  }
++  template <typename Data, typename Gate, size_t D>
++  void launch(const Views& v) const {
++    auto ptr = [&](size_t i) -> void* {
++      return v[i] ? const_cast<void*>(v[i]->data()) : nullptr;
++    };
++    dim3 grid(static_cast<unsigned int>(B_), static_cast<unsigned int>(Hv_), 1);
++    const auto stream =
++        static_cast<typename Runtime<Device::Type::kMetax>::Stream>(
++            stream_ ? stream_ : nullptr);
++    chunk_native_detail::kernel<Data, Gate, D><<<grid, D, 0, stream>>>(
++        static_cast<float*>(workspace_), static_cast<const Data*>(ptr(0)),
++        static_cast<const Data*>(ptr(1)), static_cast<const Data*>(ptr(2)),
++        static_cast<const Gate*>(ptr(3)), static_cast<const Gate*>(ptr(4)),
++        static_cast<Data*>(ptr(5)), ptr(6), ptr(7), ptr(8),
++        static_cast<Data*>(ptr(9)), static_cast<Data*>(ptr(10)), p_);
++  }
++};
++}  // namespace infini::ops
++
++#endif
+diff --git a/src/native/cuda/metax/ops/deepseek_moe/kernel.h b/src/native/cuda/metax/ops/deepseek_moe/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f57edb86b9eb019aa6a5d7dc617590c2b2fe47b6
+--- /dev/null
++++ b/src/native/cuda/metax/ops/deepseek_moe/kernel.h
+@@ -0,0 +1,31 @@
++#ifndef INFINI_OPS_METAX_DEEPSEEK_MOE_KERNEL_H_
++#define INFINI_OPS_METAX_DEEPSEEK_MOE_KERNEL_H_
++
++#include <stdexcept>
++#include <vector>
++
++#include "base/deepseek_moe.h"
++
++namespace infini::ops {
++
++// DeepSeek MoE has no MetaX implementation yet. The operator
++// is registered so that models referencing it link; calling
++// it on MetaX throws.
++template <>
++class Operator<DeepseekMoe, Device::Type::kMetax, 0> : public DeepseekMoe {
++ public:
++  using DeepseekMoe::DeepseekMoe;
++  using DeepseekMoe::operator();
++
++  bool capture_safe() const override { return false; }
++
++  void operator()(Tensor, const Tensor, const Tensor, const Tensor,
++                  const std::vector<Tensor>, const std::vector<Tensor>,
++                  const std::vector<Tensor>, size_t, size_t) const override {
++    throw std::runtime_error("DeepseekMoe is not supported on MetaX");
++  }
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_METAX_DEEPSEEK_MOE_KERNEL_H_
+diff --git a/src/native/cuda/metax/ops/fused_gated_delta_net_gating/kernel.h b/src/native/cuda/metax/ops/fused_gated_delta_net_gating/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..afa7a3be4bbd8049a429a47cc9238282aa311b11
+--- /dev/null
++++ b/src/native/cuda/metax/ops/fused_gated_delta_net_gating/kernel.h
+@@ -0,0 +1,115 @@
++#ifndef INFINI_OPS_METAX_FUSED_GATED_DELTA_NET_GATING_KERNEL_H_
++#define INFINI_OPS_METAX_FUSED_GATED_DELTA_NET_GATING_KERNEL_H_
++
++#include <array>
++#include <cmath>
++#include <cstring>
++#include <functional>
++#include <stdexcept>
++
++#include "base/fused_gated_delta_net_gating.h"
++#include "native/cuda/metax/caster.cuh"
++#include "native/cuda/metax/runtime_.h"
++// cuda_fp16.h / cuda_bf16.h come from the MACA cu-bridge,
++// where __nv_bfloat16 aliases __maca_bfloat16.
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++namespace infini::ops {
++namespace metax_gating_detail {
++struct Layout {
++  ptrdiff_t strides[6][3]{};
++  size_t total, seq, hidden;
++  float beta, threshold;
++};
++template <typename T>
++__global__ void kernel(const T* A, const T* a, const T* b, const T* dt,
++                       float* g, float* betao, Layout p) {
++  const size_t linear =
++      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++  if (linear >= p.total) return;
++  const size_t h = linear % p.hidden, s = (linear / p.hidden) % p.seq;
++  const size_t batch = linear / p.hidden / p.seq;
++  ptrdiff_t offsets[6];
++  for (int i = 0; i < 6; ++i)
++    offsets[i] = static_cast<ptrdiff_t>(batch) * p.strides[i][0] +
++                 static_cast<ptrdiff_t>(s) * p.strides[i][1] +
++                 static_cast<ptrdiff_t>(h) * p.strides[i][2];
++  const float x = static_cast<float>(a[offsets[1]]) +
++                  static_cast<float>(dt[h * p.strides[3][0]]);
++  const float bx = p.beta * x;
++  const float softplus = bx <= p.threshold ? log1pf(expf(bx)) / p.beta : x;
++  g[offsets[4]] = -expf(static_cast<float>(A[h * p.strides[0][0]])) * softplus;
++  const float bv = static_cast<float>(b[offsets[2]]);
++  const float z = expf(bv >= 0 ? -bv : bv);
++  betao[offsets[5]] = bv >= 0 ? 1.0f / (1.0f + z) : z / (1.0f + z);
++}
++}  // namespace metax_gating_detail
++
++template <>
++class Operator<FusedGatedDeltaNetGating, Device::Type::kMetax>
++    : public FusedGatedDeltaNetGating {
++ public:
++  using FusedGatedDeltaNetGating::FusedGatedDeltaNetGating;
++  using FusedGatedDeltaNetGating::operator();
++
++  bool capture_safe() const override { return true; }
++
++  void operator()(Tensor A, Tensor a, Tensor b, Tensor dt, float beta,
++                  float threshold, Tensor g, Tensor betao) const override {
++    auto& p = const_cast<metax_gating_detail::Layout&>(p_);
++    std::array<Tensor, 6> tensors{A, a, b, dt, g, betao};
++    for (size_t i = 0; i < 6; ++i)
++      if (!std::equal_to<Tensor>{}(tensors[i], metadata_[i]))
++        throw std::invalid_argument("gating metadata changed after Make");
++    if (std::memcmp(&beta, &beta_, sizeof(float)) ||
++        std::memcmp(&threshold, &threshold_, sizeof(float)))
++      throw std::invalid_argument("gating attributes changed after Make");
++    if (total_ / 256 + (total_ % 256 != 0) >
++        std::numeric_limits<unsigned int>::max())
++      throw std::overflow_error("gating grid exceeds CUDA limit");
++    p.total = total_;
++    p.seq = seq_;
++    p.hidden = hidden_;
++    p.beta = beta_;
++    p.threshold = threshold_;
++    for (size_t i = 0; i < 6; ++i)
++      for (size_t j = 0; j < metadata_[i].strides().size(); ++j)
++        p.strides[i][j] = metadata_[i].strides()[j];
++    if (!total_) return;
++    const dim3 grid(
++        static_cast<unsigned int>(total_ / 256 + (total_ % 256 != 0)));
++    const auto stream =
++        static_cast<typename Runtime<Device::Type::kMetax>::Stream>(
++            stream_ ? stream_ : nullptr);
++    switch (metadata_[1].dtype()) {
++      case DataType::kFloat32:
++        launch<float>(A, a, b, dt, g, betao, grid, stream);
++        break;
++      case DataType::kFloat16:
++        launch<half>(A, a, b, dt, g, betao, grid, stream);
++        break;
++      case DataType::kBFloat16:
++        launch<__nv_bfloat16>(A, a, b, dt, g, betao, grid, stream);
++        break;
++      default:
++        throw std::invalid_argument("gating dtype unsupported");
++    }
++  }
++
++ private:
++  mutable metax_gating_detail::Layout p_{};
++  template <typename T>
++  void launch(Tensor A, Tensor a, Tensor b, Tensor dt, Tensor g, Tensor betao,
++              dim3 grid,
++              typename Runtime<Device::Type::kMetax>::Stream stream) const {
++    metax_gating_detail::kernel<T><<<grid, 256, 0, stream>>>(
++        static_cast<const T*>(A.data()), static_cast<const T*>(a.data()),
++        static_cast<const T*>(b.data()), static_cast<const T*>(dt.data()),
++        static_cast<float*>(g.data()), static_cast<float*>(betao.data()), p_);
++  }
++};
++
++}  // namespace infini::ops
++
++#endif
+diff --git a/src/native/cuda/metax/ops/i8_gemm/kernel.h b/src/native/cuda/metax/ops/i8_gemm/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..de0ef47f8a9cc125a70e5780cce2ad636247fe3e
+--- /dev/null
++++ b/src/native/cuda/metax/ops/i8_gemm/kernel.h
+@@ -0,0 +1,36 @@
++#ifndef INFINI_OPS_METAX_I8_GEMM_KERNEL_H_
++#define INFINI_OPS_METAX_I8_GEMM_KERNEL_H_
++
++#include <stdexcept>
++
++#include "base/i8_gemm.h"
++
++namespace infini::ops {
++
++// INT8 GEMM has no MetaX implementation. The operator is
++// registered so that models referencing it link; calling it on
++// MetaX throws.
++template <>
++class Operator<I8Gemm, Device::Type::kMetax, 0> : public I8Gemm {
++ public:
++  using I8Gemm::I8Gemm;
++  using I8Gemm::operator();
++
++  bool capture_safe() const override { return false; }
++
++  void operator()(Tensor c, const Tensor a, const Tensor as, const Tensor b,
++                  const Tensor bs,
++                  const std::optional<Tensor> bias) const override {
++    (void)c;
++    (void)a;
++    (void)as;
++    (void)b;
++    (void)bs;
++    (void)bias;
++    throw std::runtime_error("I8Gemm is not supported on MetaX");
++  }
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_METAX_I8_GEMM_KERNEL_H_
+diff --git a/src/native/cuda/metax/ops/mamba_selective_scan/kernel.h b/src/native/cuda/metax/ops/mamba_selective_scan/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..61947fc9c25b11c1b9fb22c645ef33dad81f6e85
+--- /dev/null
++++ b/src/native/cuda/metax/ops/mamba_selective_scan/kernel.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include "native/cuda/metax/caster.cuh"
++#include "native/cuda/metax/runtime_.h"
++#include "native/cuda/ops/mamba_selective_scan/kernel.h"
++namespace infini::ops {
++struct MambaScanMetaxBackend : Runtime<Device::Type::kMetax> {
++  static void CheckLaunch() {}
++};
++template <>
++class Operator<MambaSelectiveScan, Device::Type::kMetax>
++    : public CudaMambaSelectiveScan<MambaScanMetaxBackend> {
++ public:
++  using CudaMambaSelectiveScan<MambaScanMetaxBackend>::CudaMambaSelectiveScan;
++};
++}  // namespace infini::ops
+diff --git a/src/native/cuda/metax/ops/moe_fused_dense/kernel.h b/src/native/cuda/metax/ops/moe_fused_dense/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8cedf837e7ab5d963ac3119bbe3dc47cf9300ea7
+--- /dev/null
++++ b/src/native/cuda/metax/ops/moe_fused_dense/kernel.h
+@@ -0,0 +1,23 @@
++#ifndef INFINI_OPS_METAX_MOE_FUSED_DENSE_KERNEL_H_
++#define INFINI_OPS_METAX_MOE_FUSED_DENSE_KERNEL_H_
++
++#include <utility>
++
++#include "native/cuda/blas.h"
++#include "native/cuda/metax/blas.h"
++#include "native/cuda/metax/caster.cuh"
++#include "native/cuda/metax/runtime_.h"
++#include "native/cuda/ops/moe_fused_dense/kernel.h"
++
++namespace infini::ops {
++
++template <>
++class Operator<MoeFusedDense, Device::Type::kMetax>
++    : public CudaMoeFusedDense<Blas<Device::Type::kMetax>> {
++ public:
++  using CudaMoeFusedDense<Blas<Device::Type::kMetax>>::CudaMoeFusedDense;
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_METAX_MOE_FUSED_DENSE_KERNEL_H_
+diff --git a/src/native/cuda/metax/ops/moe_fused_gate/kernel.h b/src/native/cuda/metax/ops/moe_fused_gate/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7d0605c72f560d208b93ec475743732e7b161e5
+--- /dev/null
++++ b/src/native/cuda/metax/ops/moe_fused_gate/kernel.h
+@@ -0,0 +1,29 @@
++#ifndef INFINI_OPS_METAX_MOE_FUSED_GATE_KERNEL_H_
++#define INFINI_OPS_METAX_MOE_FUSED_GATE_KERNEL_H_
++
++#include <stdexcept>
++
++#include "base/moe_fused_gate.h"
++
++namespace infini::ops {
++
++// MoE fused gate (DeepSeek-style grouped top-k) has no MetaX
++// implementation yet. The operator is registered so that models
++// referencing it link; calling it on MetaX throws.
++template <>
++class Operator<MoeFusedGate, Device::Type::kMetax, 0> : public MoeFusedGate {
++ public:
++  using MoeFusedGate::MoeFusedGate;
++  using MoeFusedGate::operator();
++
++  bool capture_safe() const override { return false; }
++
++  void operator()(Tensor, Tensor, const Tensor, const Tensor, size_t, size_t,
++                  size_t, float, bool) const override {
++    throw std::runtime_error("MoeFusedGate is not supported on MetaX");
++  }
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_METAX_MOE_FUSED_GATE_KERNEL_H_
+diff --git a/src/native/cuda/metax/ops/mrope/kernel.h b/src/native/cuda/metax/ops/mrope/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..352a53d93801195a01c68c88d333a25cb52796dc
+--- /dev/null
++++ b/src/native/cuda/metax/ops/mrope/kernel.h
+@@ -0,0 +1,21 @@
++#ifndef INFINI_OPS_METAX_MROPE_KERNEL_H_
++#define INFINI_OPS_METAX_MROPE_KERNEL_H_
++
++#include <utility>
++
++#include "native/cuda/metax/caster.cuh"
++#include "native/cuda/metax/runtime_.h"
++#include "native/cuda/ops/mrope/kernel.h"
++
++namespace infini::ops {
++
++template <>
++class Operator<Mrope, Device::Type::kMetax>
++    : public CudaMrope<Runtime<Device::Type::kMetax>> {
++ public:
++  using CudaMrope<Runtime<Device::Type::kMetax>>::CudaMrope;
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_METAX_MROPE_KERNEL_H_
+diff --git a/src/native/cuda/metax/ops/per_channel_quant_i8/kernel.h b/src/native/cuda/metax/ops/per_channel_quant_i8/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..95f6c42311ef82eec87ce737f9fd2ada2032ec4d
+--- /dev/null
++++ b/src/native/cuda/metax/ops/per_channel_quant_i8/kernel.h
+@@ -0,0 +1,32 @@
++#ifndef INFINI_OPS_METAX_PER_CHANNEL_QUANT_I8_KERNEL_H_
++#define INFINI_OPS_METAX_PER_CHANNEL_QUANT_I8_KERNEL_H_
++
++#include <stdexcept>
++
++#include "base/per_channel_quant_i8.h"
++
++namespace infini::ops {
++
++// Per-channel INT8 quantization has no MetaX implementation.
++// The operator is registered so that models referencing it link;
++// calling it on MetaX throws.
++template <>
++class Operator<PerChannelQuantI8, Device::Type::kMetax, 0>
++    : public PerChannelQuantI8 {
++ public:
++  using PerChannelQuantI8::PerChannelQuantI8;
++  using PerChannelQuantI8::operator();
++
++  bool capture_safe() const override { return false; }
++
++  void operator()(const Tensor x, Tensor packed, Tensor scale) const override {
++    (void)x;
++    (void)packed;
++    (void)scale;
++    throw std::runtime_error("PerChannelQuantI8 is not supported on MetaX");
++  }
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_METAX_PER_CHANNEL_QUANT_I8_KERNEL_H_
+diff --git a/src/native/cuda/metax/ops/per_tensor_i8/kernel.h b/src/native/cuda/metax/ops/per_tensor_i8/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..271a5aa40d76a364a74a68ac19a5d3b19dbd208b
+--- /dev/null
++++ b/src/native/cuda/metax/ops/per_tensor_i8/kernel.h
+@@ -0,0 +1,238 @@
++#ifndef INFINI_OPS_METAX_PER_TENSOR_I8_KERNEL_H_
++#define INFINI_OPS_METAX_PER_TENSOR_I8_KERNEL_H_
++
++#include <algorithm>
++#include <cstdint>
++#include <optional>
++#include <stdexcept>
++
++#include "data_type.h"
++#include "dispatcher.h"
++#include "native/cuda/metax/caster.cuh"
++#include "native/cuda/metax/runtime_.h"
++
++namespace infini::ops {
++namespace metax_per_tensor_i8_detail {
++
++struct Layout {
++  std::int64_t ndim = 0, shape[4]{}, x_stride[4]{}, packed_stride[4]{};
++};
++
++__device__ std::int64_t Offset(std::size_t linear, const Layout& l,
++                               bool packed) {
++  std::int64_t offset = 0;
++  for (std::int64_t d = l.ndim; d-- > 0;) {
++    auto coord = linear % l.shape[d];
++    linear /= l.shape[d];
++    offset += coord * (packed ? l.packed_stride[d] : l.x_stride[d]);
++  }
++  return offset;
++}
++
++__device__ void AtomicMax(float* ptr, float value) {
++  auto bits = reinterpret_cast<int*>(ptr);
++  int old = *bits, assumed;
++  do {
++    assumed = old;
++    old = atomicCAS(bits, assumed,
++                    __float_as_int(fmaxf(value, __int_as_float(assumed))));
++  } while (old != assumed);
++}
++
++template <typename T>
++__global__ void Absmax(const T* x, float* scale, Layout l, std::size_t count) {
++  float maximum = 0;
++  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
++       i += std::size_t(gridDim.x) * blockDim.x)
++    maximum = fmaxf(maximum, fabsf(float(x[Offset(i, l, false)])));
++  AtomicMax(scale, maximum / 127.0f);
++}
++
++template <typename T>
++__global__ void Quant(const T* x, std::int8_t* packed, const float* scale,
++                      Layout l, std::size_t count) {
++  const float inverse = 1.0f / scale[0];
++  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
++       i += std::size_t(gridDim.x) * blockDim.x) {
++    const float value = float(x[Offset(i, l, false)]) * inverse;
++    const float rounded = floorf(fabsf(value) + 0.5f);
++    int q = value >= 0 ? int(rounded) : -int(rounded);
++    q = q > 127 ? 127 : (q < -127 ? -127 : q);
++    packed[Offset(i, l, true)] = std::int8_t(q);
++  }
++}
++
++template <typename T>
++__global__ void Dequant(T* x, const std::int8_t* packed, const float* scale,
++                        Layout l, std::size_t count) {
++  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
++       i += std::size_t(gridDim.x) * blockDim.x)
++    x[Offset(i, l, false)] = T(float(packed[Offset(i, l, true)]) * scale[0]);
++}
++
++inline bool Supports(Tensor x, Tensor packed, Tensor scale,
++                     const std::optional<Tensor> zero, bool quant,
++                     bool is_static = true) {
++  if (zero ||
++      (x.dtype() != DataType::kFloat16 && x.dtype() != DataType::kFloat32 &&
++       x.dtype() != DataType::kBFloat16) ||
++      packed.dtype() != DataType::kInt8 ||
++      scale.dtype() != DataType::kFloat32 || scale.numel() != 1 ||
++      x.device() != packed.device() || x.device() != scale.device() ||
++      x.shape() != packed.shape() || x.ndim() > 4 ||
++      x.strides().size() != x.ndim() ||
++      packed.strides().size() != packed.ndim() ||
++      !(quant ? x.IsContiguous() : packed.IsContiguous()) ||
++      (quant && !is_static && !scale.IsContiguous()))
++    return false;
++  for (std::size_t d = 0; d < x.ndim(); ++d)
++    if (x.strides()[d] < 0 || packed.strides()[d] < 0 ||
++        x.shape()[d] > static_cast<std::size_t>(INT64_MAX))
++      return false;
++  return true;
++}
++
++struct Metadata {
++  DataType dtype;
++  Layout layout{};
++  std::size_t count;
++  Device device;
++  Metadata(Tensor x, Tensor packed)
++      : dtype(x.dtype()), count(x.numel()), device(x.device()) {
++    layout.ndim = x.ndim();
++    for (std::size_t d = 0; d < x.ndim(); ++d) {
++      layout.shape[d] = x.shape()[d];
++      layout.x_stride[d] = x.strides()[d];
++      layout.packed_stride[d] = packed.strides()[d];
++    }
++  }
++  bool Matches(Tensor x, Tensor packed) const {
++    if (x.dtype() != dtype || x.device() != device ||
++        x.ndim() != static_cast<std::size_t>(layout.ndim))
++      return false;
++    for (std::size_t d = 0; d < x.ndim(); ++d)
++      if (x.shape()[d] != static_cast<std::size_t>(layout.shape[d]) ||
++          x.strides()[d] != layout.x_stride[d] ||
++          packed.strides()[d] != layout.packed_stride[d])
++        return false;
++    return true;
++  }
++};
++
++template <typename T>
++void SubmitQuant(const void* x, std::int8_t* packed, float* scale, Layout l,
++                 std::size_t count, bool is_static,
++                 Runtime<Device::Type::kMetax>::Stream stream) {
++  const unsigned blocks =
++      unsigned(std::min<std::size_t>((count - 1) / 256 + 1, 65535));
++  if (!is_static) {
++    Absmax<T>
++        <<<blocks, 256, 0, stream>>>(static_cast<const T*>(x), scale, l, count);
++  }
++  Quant<T><<<blocks, 256, 0, stream>>>(static_cast<const T*>(x), packed, scale,
++                                       l, count);
++}
++
++template <typename T>
++void Dequantize(void* x, const std::int8_t* packed, const float* scale,
++                Layout l, std::size_t count,
++                Runtime<Device::Type::kMetax>::Stream stream) {
++  const unsigned blocks =
++      unsigned(std::min<std::size_t>((count - 1) / 256 + 1, 65535));
++  Dequant<T>
++      <<<blocks, 256, 0, stream>>>(static_cast<T*>(x), packed, scale, l, count);
++}
++
++inline Tensor Checked(Tensor x, Tensor packed, Tensor scale,
++                      const std::optional<Tensor> zero, bool quant,
++                      bool is_static = true) {
++  if (!Supports(x, packed, scale, zero, quant, is_static))
++    throw std::invalid_argument("unsupported per-tensor INT8 operands");
++  return x;
++}
++
++}  // namespace metax_per_tensor_i8_detail
++
++template <>
++class Operator<PerTensorQuantI8, Device::Type::kMetax, 0>
++    : public PerTensorQuantI8 {
++ public:
++  static bool supports(const Tensor x, Tensor packed, Tensor scale,
++                       const std::optional<Tensor> zero, const bool is_static) {
++    return metax_per_tensor_i8_detail::Supports(x, packed, scale, zero, true,
++                                                is_static);
++  }
++  Operator(const Tensor x, Tensor packed, Tensor scale,
++           const std::optional<Tensor> zero, const bool is_static)
++      : PerTensorQuantI8(x, packed, scale, zero, is_static),
++        meta_(metax_per_tensor_i8_detail::Checked(x, packed, scale, zero, true,
++                                                  is_static),
++              packed),
++        is_static_(is_static) {}
++  bool capture_safe() const override { return true; }
++  void operator()(const Tensor x, Tensor packed, Tensor scale,
++                  const std::optional<Tensor> zero,
++                  const bool is_static) const override {
++    if (!supports(x, packed, scale, zero, is_static) ||
++        !meta_.Matches(x, packed) || is_static != is_static_)
++      throw std::invalid_argument("unsupported per-tensor INT8 operands");
++    auto stream = static_cast<Runtime<Device::Type::kMetax>::Stream>(
++        stream_ ? stream_ : 0);
++    DispatchFunc<
++        List<DataType::kFloat16, DataType::kBFloat16, DataType::kFloat32>>(
++        {static_cast<int64_t>(meta_.dtype)},
++        [&](auto type_tag) {
++          using T = TypeMapType<Device::Type::kMetax, ListGet<0>(type_tag)>;
++          metax_per_tensor_i8_detail::template SubmitQuant<T>(
++              x.data(), static_cast<std::int8_t*>(packed.data()),
++              static_cast<float*>(scale.data()), meta_.layout, meta_.count,
++              is_static, stream);
++        },
++        "MetaxPerTensorQuantI8");
++  }
++
++ private:
++  metax_per_tensor_i8_detail::Metadata meta_;
++  bool is_static_;
++};
++
++template <>
++class Operator<PerTensorDequantI8, Device::Type::kMetax, 0>
++    : public PerTensorDequantI8 {
++ public:
++  static bool supports(Tensor x, const Tensor packed, const Tensor scale,
++                       const std::optional<Tensor> zero) {
++    return metax_per_tensor_i8_detail::Supports(x, packed, scale, zero, false);
++  }
++  Operator(Tensor x, const Tensor packed, const Tensor scale,
++           const std::optional<Tensor> zero)
++      : PerTensorDequantI8(x, packed, scale, zero),
++        meta_(
++            metax_per_tensor_i8_detail::Checked(x, packed, scale, zero, false),
++            packed) {}
++  bool capture_safe() const override { return true; }
++  void operator()(Tensor x, const Tensor packed, const Tensor scale,
++                  const std::optional<Tensor> zero) const override {
++    if (!supports(x, packed, scale, zero) || !meta_.Matches(x, packed))
++      throw std::invalid_argument("unsupported per-tensor INT8 operands");
++    auto stream = static_cast<Runtime<Device::Type::kMetax>::Stream>(
++        stream_ ? stream_ : 0);
++    DispatchFunc<
++        List<DataType::kFloat16, DataType::kBFloat16, DataType::kFloat32>>(
++        {static_cast<int64_t>(meta_.dtype)},
++        [&](auto type_tag) {
++          using T = TypeMapType<Device::Type::kMetax, ListGet<0>(type_tag)>;
++          metax_per_tensor_i8_detail::template Dequantize<T>(
++              x.data(), static_cast<const std::int8_t*>(packed.data()),
++              static_cast<const float*>(scale.data()), meta_.layout,
++              meta_.count, stream);
++        },
++        "MetaxPerTensorDequantI8");
++  }
++
++ private:
++  metax_per_tensor_i8_detail::Metadata meta_;
++};
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_METAX_PER_TENSOR_I8_KERNEL_H_
+diff --git a/src/native/cuda/metax/ops/recurrent_gated_delta_rule/kernel.h b/src/native/cuda/metax/ops/recurrent_gated_delta_rule/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..117407a65a5e918bf29412b2f455d8b687104c95
+--- /dev/null
++++ b/src/native/cuda/metax/ops/recurrent_gated_delta_rule/kernel.h
+@@ -0,0 +1,148 @@
++#ifndef INFINI_OPS_METAX_RECURRENT_GATED_DELTA_RULE_KERNEL_H_
++#define INFINI_OPS_METAX_RECURRENT_GATED_DELTA_RULE_KERNEL_H_
++
++#include <climits>
++#include <stdexcept>
++
++#include "base/recurrent_gated_delta_rule.h"
++#include "native/cuda/metax/runtime_.h"
++#include "recurrent_gated_delta_rule_legacy_kernel.cuh"
++// cuda_fp16.h / cuda_bf16.h come from the MACA cu-bridge,
++// where __nv_bfloat16 aliases __maca_bfloat16.
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++namespace infini::ops {
++namespace metax_recurrent_detail {
++struct Layout {
++  ptrdiff_t s[10][4]{};
++  bool initial_i64, final_i64, norm, indexed;
++  size_t pool, Hk, ratio;
++};
++template <typename Data, typename Gate, size_t D>
++__global__ void kernel(const Data* q, const Data* k, const Data* v,
++                       const Gate* g, const Gate* beta, Data* state,
++                       const void* initial_indices, const void* final_indices,
++                       Data* out, Data* final_state, Layout p) {
++  extern __shared__ float shared[];
++  recurrentGatedDeltaRuleIndexedPoolWarpKernel<Data, Gate, float, D, D, 8>(
++      out, state, final_state, q, k, v, g, beta, initial_indices, final_indices,
++      p.initial_i64, p.final_i64, p.norm, p.indexed, p.pool, p.Hk, p.ratio,
++      p.s[8][0], p.s[8][1], p.s[8][2], p.s[5][0], p.s[5][1], p.s[5][2],
++      p.s[5][3], p.s[9][0], p.s[9][1], p.s[9][2], p.s[9][3], p.s[0][0],
++      p.s[0][1], p.s[0][2], p.s[1][0], p.s[1][1], p.s[1][2], p.s[2][0],
++      p.s[2][1], p.s[2][2], p.s[3][0], p.s[3][1], p.s[3][2], p.s[4][0],
++      p.s[4][1], p.s[4][2], shared);
++}
++}  // namespace metax_recurrent_detail
++
++template <>
++class Operator<RecurrentGatedDeltaRule, Device::Type::kMetax>
++    : public RecurrentGatedDeltaRule {
++ public:
++  Operator(const Tensor q, const Tensor k, const Tensor v, const Tensor g,
++           const Tensor beta, Tensor initial_state,
++           const std::optional<Tensor> initial_state_indices,
++           const std::optional<Tensor> final_state_indices, Tensor out,
++           std::optional<Tensor> final_state, bool use_qk_l2norm)
++      : RecurrentGatedDeltaRule(q, k, v, g, beta, initial_state,
++                                initial_state_indices, final_state_indices, out,
++                                final_state, use_qk_l2norm) {
++    if (q.shape()[1] != 1 || v.shape()[3] != D_ || (D_ != 64 && D_ != 128))
++      throw std::invalid_argument(
++          "MetaX recurrent delta kernels require T1 and Dk=Dv64/128");
++    if (B_ >= static_cast<size_t>(INT_MAX) || Hv_ > 65535 ||
++        Hk_ > static_cast<size_t>(INT_MAX))
++      throw std::invalid_argument("recurrent delta launch extent unsupported");
++    p_.pool = pool_;
++    p_.Hk = Hk_;
++    p_.ratio = Hv_ / Hk_;
++    p_.norm = norm_;
++    p_.indexed = metadata_[6].has_value() || metadata_[7].has_value();
++    p_.initial_i64 = metadata_[6] && metadata_[6]->dtype() == DataType::kInt64;
++    p_.final_i64 = metadata_[7] && metadata_[7]->dtype() == DataType::kInt64;
++    for (size_t i = 0; i < metadata_.size(); ++i)
++      if (metadata_[i])
++        for (size_t j = 0; j < metadata_[i]->strides().size(); ++j)
++          p_.s[i][j] = metadata_[i]->strides()[j];
++  }
++  void operator()(const Tensor q, const Tensor k, const Tensor v,
++                  const Tensor g, const Tensor beta, Tensor initial_state,
++                  const std::optional<Tensor> initial_state_indices,
++                  const std::optional<Tensor> final_state_indices, Tensor out,
++                  std::optional<Tensor> final_state,
++                  bool use_qk_l2norm) const override {
++    const Views views{q,
++                      k,
++                      v,
++                      g,
++                      beta,
++                      initial_state,
++                      initial_state_indices,
++                      final_state_indices,
++                      out,
++                      final_state};
++    CheckInvocation(views, use_qk_l2norm);
++    if (!B_) return;
++    switch (data_type_) {
++      case DataType::kFloat16:
++        gate<half>(views);
++        break;
++      case DataType::kBFloat16:
++        gate<__nv_bfloat16>(views);
++        break;
++      case DataType::kFloat32:
++        gate<float>(views);
++        break;
++      default:
++        throw std::invalid_argument("recurrent delta data dtype unsupported");
++    }
++  }
++
++ private:
++  metax_recurrent_detail::Layout p_{};
++  template <typename Data>
++  void gate(const Views& v) const {
++    switch (gate_type_) {
++      case DataType::kFloat16:
++        dimension<Data, half>(v);
++        break;
++      case DataType::kBFloat16:
++        dimension<Data, __nv_bfloat16>(v);
++        break;
++      case DataType::kFloat32:
++        dimension<Data, float>(v);
++        break;
++      default:
++        throw std::invalid_argument("recurrent delta gate dtype unsupported");
++    }
++  }
++  template <typename Data, typename Gate>
++  void dimension(const Views& v) const {
++    if (D_ == 64)
++      launch<Data, Gate, 64>(v);
++    else
++      launch<Data, Gate, 128>(v);
++  }
++  template <typename Data, typename Gate, size_t D>
++  void launch(const Views& v) const {
++    auto ptr = [&](size_t i) -> void* {
++      return v[i] ? const_cast<void*>(v[i]->data()) : nullptr;
++    };
++    dim3 grid(static_cast<unsigned int>(B_), static_cast<unsigned int>(Hv_),
++              D / 8);
++    const auto stream =
++        static_cast<typename Runtime<Device::Type::kMetax>::Stream>(
++            stream_ ? stream_ : nullptr);
++    metax_recurrent_detail::kernel<Data, Gate, D>
++        <<<grid, 256, (D * 3 + 256 + 1) * sizeof(float), stream>>>(
++            static_cast<const Data*>(ptr(0)), static_cast<const Data*>(ptr(1)),
++            static_cast<const Data*>(ptr(2)), static_cast<const Gate*>(ptr(3)),
++            static_cast<const Gate*>(ptr(4)), static_cast<Data*>(ptr(5)),
++            ptr(6), ptr(7), static_cast<Data*>(ptr(8)),
++            static_cast<Data*>(ptr(9)), p_);
++  }
++};
++}  // namespace infini::ops
++
++#endif
+diff --git a/src/native/cuda/metax/ops/recurrent_gated_delta_rule/recurrent_delta_rule_common.cuh b/src/native/cuda/metax/ops/recurrent_gated_delta_rule/recurrent_delta_rule_common.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..f36607f90bdce716d0e82f542f5d09dc376b312a
+--- /dev/null
++++ b/src/native/cuda/metax/ops/recurrent_gated_delta_rule/recurrent_delta_rule_common.cuh
+@@ -0,0 +1,265 @@
++// Ported from InfiniCore 1ab85ef1d3c2bce49edf1fc73a5b48becaf7552e:
++// src/infiniop/ops/recurrent_gated_delta_rule/cuda/recurrent_delta_rule_common.cuh.
++// Modified for InfiniOps: NVIDIA single-token decode and backend integration.
++// Copyright 2025 InfiniTensor; MIT notice: LICENSES/InfiniCore-MIT.txt.
++#ifndef __RECURRENT_DELTA_RULE_COMMON_CUH__
++#define __RECURRENT_DELTA_RULE_COMMON_CUH__
++
++#include <cmath>
++#include <cstdint>
++
++// Retain the original NVIDIA warp width.
++#define INFINIOP_RECURRENT_DELTA_RULE_WARP_SIZE 32
++#define INFINIOP_RECURRENT_DELTA_RULE_FULL_MASK 0xffffffffU
++
++namespace infini::ops::metax_recurrent_detail {
++
++template <typename T>
++__device__ inline float loadAsFloat(const T* ptr, ptrdiff_t offset) {
++  return static_cast<float>(ptr[offset]);
++}
++
++template <>
++__device__ inline float loadAsFloat<half>(const half* ptr, ptrdiff_t offset) {
++  return __half2float(ptr[offset]);
++}
++
++template <>
++__device__ inline float loadAsFloat<__nv_bfloat16>(const __nv_bfloat16* ptr,
++                                                   ptrdiff_t offset) {
++  return __bfloat162float(ptr[offset]);
++}
++
++__device__ inline int64_t loadOptionalIndex(const void* indices, bool is_i64,
++                                            int index, int fallback) {
++  if (indices == nullptr) {
++    return static_cast<int64_t>(fallback);
++  }
++  return is_i64 ? static_cast<const int64_t*>(indices)[index]
++                : static_cast<int64_t>(
++                      static_cast<const int32_t*>(indices)[index]);
++}
++
++template <typename Tcompute>
++__device__ inline Tcompute warpReduceSum(Tcompute value) {
++  constexpr int WARP_SIZE = INFINIOP_RECURRENT_DELTA_RULE_WARP_SIZE;
++#pragma unroll
++  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
++    value += __shfl_down_sync(INFINIOP_RECURRENT_DELTA_RULE_FULL_MASK, value,
++                              offset, WARP_SIZE);
++  }
++  return __shfl_sync(INFINIOP_RECURRENT_DELTA_RULE_FULL_MASK, value, 0,
++                     WARP_SIZE);
++}
++
++template <typename Tcompute>
++__device__ inline Tcompute blockReduceSum(Tcompute value, Tcompute* scratch) {
++  scratch[threadIdx.x] = value;
++  __syncthreads();
++  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++    if (threadIdx.x < stride) {
++      scratch[threadIdx.x] += scratch[threadIdx.x + stride];
++    }
++    __syncthreads();
++  }
++  const Tcompute result = scratch[0];
++  __syncthreads();
++  return result;
++}
++
++// The NVIDIA provider submits one decode token per batch row.
++template <typename Tdata, typename Tcompute, size_t Dk, size_t Dv,
++          size_t WARPS_PER_BLOCK, typename GatePolicy>
++__device__ void recurrentDeltaRuleWarpSequence(
++    Tdata* out, Tdata* initial_state, Tdata* final_state, const Tdata* q,
++    const Tdata* k, const Tdata* v, const void* initial_state_indices,
++    const void* final_state_indices, bool initial_state_indices_i64,
++    bool final_state_indices_i64, bool use_qk_l2norm, bool indexed_state_pool,
++    size_t pool_size, size_t num_key_heads, size_t value_heads_per_key_head,
++    Tcompute query_scale, ptrdiff_t out_s0, ptrdiff_t out_s1, ptrdiff_t out_s2,
++    ptrdiff_t initial_s0, ptrdiff_t initial_s1, ptrdiff_t initial_s2,
++    ptrdiff_t initial_s3, ptrdiff_t final_s0, ptrdiff_t final_s1,
++    ptrdiff_t final_s2, ptrdiff_t final_s3, ptrdiff_t q_s0, ptrdiff_t q_s1,
++    ptrdiff_t q_s2, ptrdiff_t k_s0, ptrdiff_t k_s1, ptrdiff_t k_s2,
++    ptrdiff_t v_s0, ptrdiff_t v_s1, ptrdiff_t v_s2, GatePolicy gate_policy,
++    Tcompute* shared) {
++  constexpr int WARP_SIZE = INFINIOP_RECURRENT_DELTA_RULE_WARP_SIZE;
++  constexpr int NUM_THREADS = WARPS_PER_BLOCK * WARP_SIZE;
++  constexpr int STATE_VALUES_PER_LANE = (Dk + WARP_SIZE - 1) / WARP_SIZE;
++
++  const int batch_idx = blockIdx.x;
++  const int value_head_idx = blockIdx.y;
++  const int key_head_idx =
++      value_head_idx / static_cast<int>(value_heads_per_key_head);
++  const int warp_idx = threadIdx.x / WARP_SIZE;
++  const int lane_idx = threadIdx.x & (WARP_SIZE - 1);
++  const int value_dim_idx = blockIdx.z * WARPS_PER_BLOCK + warp_idx;
++  const bool valid_value_dim = value_dim_idx < static_cast<int>(Dv);
++
++  if (key_head_idx >= static_cast<int>(num_key_heads)) {
++    return;
++  }
++
++  int64_t read_slot = batch_idx;
++  int64_t write_slot = batch_idx;
++  if (indexed_state_pool) {
++    read_slot = loadOptionalIndex(
++        initial_state_indices, initial_state_indices_i64, batch_idx, batch_idx);
++    write_slot =
++        final_state_indices == nullptr
++            ? static_cast<int64_t>(batch_idx)
++            : loadOptionalIndex(final_state_indices, final_state_indices_i64,
++                                batch_idx, batch_idx);
++    if (read_slot < 0 || read_slot >= static_cast<int64_t>(pool_size) ||
++        (final_state_indices != nullptr &&
++         (write_slot < 0 || write_slot >= static_cast<int64_t>(pool_size)))) {
++      if (valid_value_dim && lane_idx == 0) {
++        const ptrdiff_t out_base =
++            static_cast<ptrdiff_t>(batch_idx) * out_s0 +
++            static_cast<ptrdiff_t>(value_head_idx) * out_s2;
++        out[out_base + value_dim_idx] = static_cast<Tdata>(0.0f);
++      }
++      return;
++    }
++  }
++
++  const ptrdiff_t initial_base =
++      static_cast<ptrdiff_t>(read_slot) * initial_s0 +
++      static_cast<ptrdiff_t>(value_head_idx) * initial_s1 +
++      static_cast<ptrdiff_t>(value_dim_idx) * initial_s2;
++
++  Tdata* final_state_target =
++      final_state_indices == nullptr ? final_state : initial_state;
++  const ptrdiff_t final_base =
++      final_state_indices == nullptr
++          ? static_cast<ptrdiff_t>(batch_idx) * final_s0 +
++                static_cast<ptrdiff_t>(value_head_idx) * final_s1 +
++                static_cast<ptrdiff_t>(value_dim_idx) * final_s2
++          : static_cast<ptrdiff_t>(write_slot) * initial_s0 +
++                static_cast<ptrdiff_t>(value_head_idx) * initial_s1 +
++                static_cast<ptrdiff_t>(value_dim_idx) * initial_s2;
++  const ptrdiff_t final_k_stride =
++      final_state_indices == nullptr ? final_s3 : initial_s3;
++
++  Tcompute state[STATE_VALUES_PER_LANE];
++#pragma unroll
++  for (int i = 0; i < STATE_VALUES_PER_LANE; ++i) {
++    const int key_dim_idx = lane_idx + i * WARP_SIZE;
++    state[i] = valid_value_dim && key_dim_idx < static_cast<int>(Dk)
++                   ? static_cast<Tcompute>(loadAsFloat(
++                         initial_state,
++                         initial_base +
++                             static_cast<ptrdiff_t>(key_dim_idx) * initial_s3))
++                   : static_cast<Tcompute>(0);
++  }
++
++  Tcompute* q_local = shared;
++  Tcompute* k_local = q_local + Dk;
++  Tcompute* decay_local = k_local + Dk;
++  Tcompute* reduction_scratch = decay_local + Dk;
++  Tcompute* beta_shared = reduction_scratch + NUM_THREADS;
++
++  const int token_batch = batch_idx;
++  {
++    constexpr int64_t token_idx = 0;
++    const ptrdiff_t q_base = static_cast<ptrdiff_t>(token_batch) * q_s0 +
++                             static_cast<ptrdiff_t>(token_idx) * q_s1 +
++                             static_cast<ptrdiff_t>(key_head_idx) * q_s2;
++    const ptrdiff_t k_base = static_cast<ptrdiff_t>(token_batch) * k_s0 +
++                             static_cast<ptrdiff_t>(token_idx) * k_s1 +
++                             static_cast<ptrdiff_t>(key_head_idx) * k_s2;
++
++    Tcompute q_sum = 0;
++    Tcompute k_sum = 0;
++    for (int key_dim_idx = threadIdx.x; key_dim_idx < static_cast<int>(Dk);
++         key_dim_idx += NUM_THREADS) {
++      const Tcompute q_value =
++          static_cast<Tcompute>(loadAsFloat(q, q_base + key_dim_idx));
++      const Tcompute k_value =
++          static_cast<Tcompute>(loadAsFloat(k, k_base + key_dim_idx));
++      q_local[key_dim_idx] = q_value;
++      k_local[key_dim_idx] = k_value;
++      q_sum += q_value * q_value;
++      k_sum += k_value * k_value;
++    }
++    q_sum = blockReduceSum(q_sum, reduction_scratch);
++    k_sum = blockReduceSum(k_sum, reduction_scratch);
++
++    const Tcompute q_norm = use_qk_l2norm
++                                ? rsqrtf(q_sum + static_cast<Tcompute>(1e-6))
++                                : static_cast<Tcompute>(1);
++    const Tcompute k_norm = use_qk_l2norm
++                                ? rsqrtf(k_sum + static_cast<Tcompute>(1e-6))
++                                : static_cast<Tcompute>(1);
++    for (int key_dim_idx = threadIdx.x; key_dim_idx < static_cast<int>(Dk);
++         key_dim_idx += NUM_THREADS) {
++      q_local[key_dim_idx] *= q_norm * query_scale;
++      k_local[key_dim_idx] *= k_norm;
++    }
++
++    gate_policy.prepare(token_batch, token_idx, key_head_idx, value_head_idx,
++                        decay_local, beta_shared);
++    __syncthreads();
++
++    Tcompute kv_memory = 0;
++    Tcompute hq_memory = 0;
++    Tcompute kq_memory = 0;
++#pragma unroll
++    for (int i = 0; i < STATE_VALUES_PER_LANE; ++i) {
++      const int key_dim_idx = lane_idx + i * WARP_SIZE;
++      if (valid_value_dim && key_dim_idx < static_cast<int>(Dk)) {
++        const Tcompute decayed_state = state[i] * decay_local[key_dim_idx];
++        const Tcompute k_value = k_local[key_dim_idx];
++        const Tcompute q_value = q_local[key_dim_idx];
++        kv_memory += decayed_state * k_value;
++        hq_memory += decayed_state * q_value;
++        kq_memory += k_value * q_value;
++      }
++    }
++    kv_memory = warpReduceSum(kv_memory);
++    hq_memory = warpReduceSum(hq_memory);
++    kq_memory = warpReduceSum(kq_memory);
++
++    Tcompute delta = 0;
++    if (valid_value_dim && lane_idx == 0) {
++      const ptrdiff_t v_base = static_cast<ptrdiff_t>(token_batch) * v_s0 +
++                               static_cast<ptrdiff_t>(token_idx) * v_s1 +
++                               static_cast<ptrdiff_t>(value_head_idx) * v_s2;
++      const Tcompute v_value =
++          static_cast<Tcompute>(loadAsFloat(v, v_base + value_dim_idx));
++      delta = (v_value - kv_memory) * beta_shared[0];
++      const ptrdiff_t out_base =
++          static_cast<ptrdiff_t>(token_batch) * out_s0 +
++          static_cast<ptrdiff_t>(token_idx) * out_s1 +
++          static_cast<ptrdiff_t>(value_head_idx) * out_s2;
++      out[out_base + value_dim_idx] =
++          static_cast<Tdata>(hq_memory + delta * kq_memory);
++    }
++    delta = __shfl_sync(INFINIOP_RECURRENT_DELTA_RULE_FULL_MASK, delta, 0,
++                        WARP_SIZE);
++
++#pragma unroll
++    for (int i = 0; i < STATE_VALUES_PER_LANE; ++i) {
++      const int key_dim_idx = lane_idx + i * WARP_SIZE;
++      if (valid_value_dim && key_dim_idx < static_cast<int>(Dk)) {
++        state[i] =
++            state[i] * decay_local[key_dim_idx] + k_local[key_dim_idx] * delta;
++      }
++    }
++    __syncthreads();
++  }
++
++#pragma unroll
++  for (int i = 0; i < STATE_VALUES_PER_LANE; ++i) {
++    const int key_dim_idx = lane_idx + i * WARP_SIZE;
++    if (valid_value_dim && key_dim_idx < static_cast<int>(Dk)) {
++      final_state_target[final_base +
++                         static_cast<ptrdiff_t>(key_dim_idx) * final_k_stride] =
++          static_cast<Tdata>(state[i]);
++    }
++  }
++}
++
++}  // namespace infini::ops::metax_recurrent_detail
++
++#endif  // __RECURRENT_DELTA_RULE_COMMON_CUH__
+diff --git a/src/native/cuda/metax/ops/recurrent_gated_delta_rule/recurrent_gated_delta_rule_legacy_kernel.cuh b/src/native/cuda/metax/ops/recurrent_gated_delta_rule/recurrent_gated_delta_rule_legacy_kernel.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1daf6cee3341cd52837a7677db909c346b32f24
+--- /dev/null
++++ b/src/native/cuda/metax/ops/recurrent_gated_delta_rule/recurrent_gated_delta_rule_legacy_kernel.cuh
+@@ -0,0 +1,80 @@
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++// Copied from InfiniCore 1ab85ef1d3c2bce49edf1fc73a5b48becaf7552e:
++// src/infiniop/ops/recurrent_gated_delta_rule/cuda/kernel.cuh.
++// Modified for InfiniOps: retain the scalar, single-token decode path.
++// Copyright 2025 InfiniTensor; MIT notice: LICENSES/InfiniCore-MIT.txt.
++#ifndef __RECURRENT_GATED_DELTA_RULE_KERNEL_CUH__
++#define __RECURRENT_GATED_DELTA_RULE_KERNEL_CUH__
++
++#include "recurrent_delta_rule_common.cuh"
++
++template <typename Tgate, typename Tcompute, size_t Dk>
++struct ScalarGatedDeltaRulePolicy {
++  const Tgate* g;
++  const Tgate* beta;
++  ptrdiff_t g_s0;
++  ptrdiff_t g_s1;
++  ptrdiff_t g_s2;
++  ptrdiff_t beta_s0;
++  ptrdiff_t beta_s1;
++  ptrdiff_t beta_s2;
++
++  __device__ void prepare(int token_batch, int64_t token_idx, int,
++                          int value_head_idx, Tcompute* decay,
++                          Tcompute* beta_out) const {
++    if (threadIdx.x == 0) {
++      const ptrdiff_t gate_offset =
++          static_cast<ptrdiff_t>(token_batch) * g_s0 +
++          static_cast<ptrdiff_t>(token_idx) * g_s1 +
++          static_cast<ptrdiff_t>(value_head_idx) * g_s2;
++      const ptrdiff_t beta_offset =
++          static_cast<ptrdiff_t>(token_batch) * beta_s0 +
++          static_cast<ptrdiff_t>(token_idx) * beta_s1 +
++          static_cast<ptrdiff_t>(value_head_idx) * beta_s2;
++      decay[0] = expf(static_cast<Tcompute>(
++          infini::ops::metax_recurrent_detail::loadAsFloat(g, gate_offset)));
++      beta_out[0] = static_cast<Tcompute>(
++          infini::ops::metax_recurrent_detail::loadAsFloat(beta, beta_offset));
++    }
++    __syncthreads();
++    const Tcompute scalar_decay = decay[0];
++    for (int key_dim_idx = threadIdx.x; key_dim_idx < static_cast<int>(Dk);
++         key_dim_idx += blockDim.x) {
++      decay[key_dim_idx] = scalar_decay;
++    }
++  }
++};
++
++template <typename Tdata, typename Tgate, typename Tcompute, size_t Dk,
++          size_t Dv, size_t WARPS_PER_BLOCK>
++__device__ void recurrentGatedDeltaRuleIndexedPoolWarpKernel(
++    Tdata* out, Tdata* initial_state, Tdata* final_state, const Tdata* q,
++    const Tdata* k, const Tdata* v, const Tgate* g, const Tgate* beta,
++    const void* initial_state_indices, const void* final_state_indices,
++    bool initial_state_indices_i64, bool final_state_indices_i64,
++    bool use_qk_l2norm, bool indexed_state_pool, size_t pool_size,
++    size_t num_key_heads, size_t value_heads_per_key_head, ptrdiff_t out_s0,
++    ptrdiff_t out_s1, ptrdiff_t out_s2, ptrdiff_t initial_s0,
++    ptrdiff_t initial_s1, ptrdiff_t initial_s2, ptrdiff_t initial_s3,
++    ptrdiff_t final_s0, ptrdiff_t final_s1, ptrdiff_t final_s2,
++    ptrdiff_t final_s3, ptrdiff_t q_s0, ptrdiff_t q_s1, ptrdiff_t q_s2,
++    ptrdiff_t k_s0, ptrdiff_t k_s1, ptrdiff_t k_s2, ptrdiff_t v_s0,
++    ptrdiff_t v_s1, ptrdiff_t v_s2, ptrdiff_t g_s0, ptrdiff_t g_s1,
++    ptrdiff_t g_s2, ptrdiff_t beta_s0, ptrdiff_t beta_s1, ptrdiff_t beta_s2,
++    Tcompute* shared) {
++  const ScalarGatedDeltaRulePolicy<Tgate, Tcompute, Dk> gate_policy{
++      g, beta, g_s0, g_s1, g_s2, beta_s0, beta_s1, beta_s2,
++  };
++  infini::ops::metax_recurrent_detail::recurrentDeltaRuleWarpSequence<
++      Tdata, Tcompute, Dk, Dv, WARPS_PER_BLOCK>(
++      out, initial_state, final_state, q, k, v, initial_state_indices,
++      final_state_indices, initial_state_indices_i64, final_state_indices_i64,
++      use_qk_l2norm, indexed_state_pool, pool_size, num_key_heads,
++      value_heads_per_key_head, rsqrtf(static_cast<Tcompute>(Dk)), out_s0,
++      out_s1, out_s2, initial_s0, initial_s1, initial_s2, initial_s3, final_s0,
++      final_s1, final_s2, final_s3, q_s0, q_s1, q_s2, k_s0, k_s1, k_s2, v_s0,
++      v_s1, v_s2, gate_policy, shared);
++}
++
++#endif  // __RECURRENT_GATED_DELTA_RULE_KERNEL_CUH__
+diff --git a/src/native/cuda/metax/ops/w4_marlin/kernel.h b/src/native/cuda/metax/ops/w4_marlin/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..233c4ccf26a348c58e5aa7ef724bf59172316844
+--- /dev/null
++++ b/src/native/cuda/metax/ops/w4_marlin/kernel.h
+@@ -0,0 +1,63 @@
++#ifndef INFINI_OPS_METAX_W4_MARLIN_KERNEL_H_
++#define INFINI_OPS_METAX_W4_MARLIN_KERNEL_H_
++
++#include <stdexcept>
++
++#include "base/w4_marlin_gemm.h"
++#include "base/w4_marlin_parameters.h"
++#include "base/w4_marlin_repack.h"
++
++namespace infini::ops {
++
++// W4 Marlin is NVIDIA-CUTLASS-specific and has no MetaX
++// implementation. The operators are registered so that models
++// referencing them link; calling them on MetaX throws.
++template <>
++class Operator<W4MarlinGemm, Device::Type::kMetax, 0> : public W4MarlinGemm {
++ public:
++  using W4MarlinGemm::W4MarlinGemm;
++  using W4MarlinGemm::operator();
++
++  bool capture_safe() const override { return false; }
++
++  void operator()(const Tensor, const Tensor, const Tensor, const Tensor,
++                  const Tensor, const Tensor, const Tensor, const int64_t,
++                  const int64_t, const bool, const float,
++                  Tensor) const override {
++    throw std::runtime_error("W4MarlinGemm is not supported on MetaX");
++  }
++};
++
++template <>
++class Operator<W4MarlinRepack, Device::Type::kMetax, 0>
++    : public W4MarlinRepack {
++ public:
++  using W4MarlinRepack::W4MarlinRepack;
++  using W4MarlinRepack::operator();
++
++  bool capture_safe() const override { return false; }
++
++  void operator()(const Tensor, const Tensor, const int64_t, const int64_t,
++                  const int64_t, Tensor) const override {
++    throw std::runtime_error("W4MarlinRepack is not supported on MetaX");
++  }
++};
++
++template <>
++class Operator<W4MarlinParameters, Device::Type::kMetax, 0>
++    : public W4MarlinParameters {
++ public:
++  using W4MarlinParameters::W4MarlinParameters;
++  using W4MarlinParameters::operator();
++
++  bool capture_safe() const override { return false; }
++
++  void operator()(const Tensor, const Tensor, const int64_t, const int64_t,
++                  const int64_t, const int64_t, Tensor, Tensor) const override {
++    throw std::runtime_error("W4MarlinParameters is not supported on MetaX");
++  }
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_METAX_W4_MARLIN_KERNEL_H_
+diff --git a/src/native/cuda/ops/moe_fused_dense/kernel.cuh b/src/native/cuda/ops/moe_fused_dense/kernel.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..97848ea9bd9988ce30219bd48499cf28dc2b9561
+--- /dev/null
++++ b/src/native/cuda/ops/moe_fused_dense/kernel.cuh
+@@ -0,0 +1,158 @@
++#ifndef INFINI_OPS_CUDA_MOE_FUSED_DENSE_KERNEL_CUH_
++#define INFINI_OPS_CUDA_MOE_FUSED_DENSE_KERNEL_CUH_
++
++#include <cmath>
++
++#include "native/cuda/kernel_commons.cuh"
++
++namespace infini::ops {
++namespace moe_fused_dense_detail {
++
++// Computes the inclusive prefix sum of `counts[0..num_experts-1]`,
++// storing the exclusive prefix in `offsets[0..num_experts-1]` and the
++// total in `offsets[num_experts]`. Only one thread (thread 0) is used.
++template <Device::Type kDev>
++__global__ void ExclusivePrefixCountsKernel(const int* counts, int* offsets,
++                                            int num_experts) {
++  if (threadIdx.x == 0) {
++    offsets[0] = 0;
++    int sum = 0;
++    for (int i = 0; i < num_experts; ++i) {
++      sum += counts[i];
++      offsets[i + 1] = sum;
++    }
++  }
++}
++
++// For each aligned block of `block_size` tokens, atomically adds `block_size`
++// to the count of the expert that owns the block. Rows whose expert id is
++// out of range (padding rows) are skipped. `num_tokens_post_padded` is read
++// on the host before launch.
++__global__ void CountAlignedExpertsKernel(const int* expert_ids,
++                                          int num_tokens_post_padded,
++                                          int* counts, int num_experts,
++                                          int block_size) {
++  int block = blockIdx.x * blockDim.x + threadIdx.x;
++  int num_blocks = (num_tokens_post_padded + block_size - 1) / block_size;
++  if (block >= num_blocks) {
++    return;
++  }
++  int expert = expert_ids[block];
++  if (expert >= 0 && expert < num_experts) {
++    atomicAdd(counts + expert, block_size);
++  }
++}
++
++// Gathers hidden states into a packed, expert-bucketed buffer. Each output
++// row `row` maps to `pair = sorted_token_ids[row]`, and its hidden state is
++// copied from the source token `pair / topk`. Rows pointing past the valid
++// pair range (padding) are zero-filled.
++template <Device::Type kDev, typename T>
++__global__ void PackHiddenAlignedKernel(const T* hidden,
++                                        const int* sorted_token_ids,
++                                        int* output_permutation,
++                                        T* packed_hidden, int pairs, int topk,
++                                        int hidden_size,
++                                        int max_num_tokens_padded) {
++  int row = blockIdx.x;
++  int tid = threadIdx.x;
++  if (row >= max_num_tokens_padded) {
++    return;
++  }
++  int pair = sorted_token_ids[row];
++  if (pair >= 0 && pair < pairs) {
++    if (tid == 0) {
++      output_permutation[pair] = row;
++    }
++    int token = pair / topk;
++    for (int h = tid; h < hidden_size; h += blockDim.x) {
++      packed_hidden[static_cast<size_t>(row) * hidden_size + h] =
++          hidden[static_cast<size_t>(token) * hidden_size + h];
++    }
++  } else {
++    for (int h = tid; h < hidden_size; h += blockDim.x) {
++      packed_hidden[static_cast<size_t>(row) * hidden_size + h] =
++          Caster<kDev>::template Cast<T>(0.0f);
++    }
++  }
++}
++
++// Fills the packed gate_up / expert_out rows routed to `expert` with the
++// per-expert bias rows, so GEMM with beta=1 incorporates the bias.
++template <Device::Type kDev, typename T>
++__global__ void FillPrefillBiasKernel(T* gate_up, T* expert_out, const T* bias1,
++                                      const T* bias2, const int* counts,
++                                      const int* offsets, int intermediate_size,
++                                      int hidden_size) {
++  const int expert = blockIdx.x;
++  const int rows = counts[expert];
++  const int offset = offsets[expert];
++  const int gate_columns = intermediate_size * 2;
++  if (bias1) {
++    for (size_t i = threadIdx.x; i < static_cast<size_t>(rows) * gate_columns;
++         i += blockDim.x) {
++      gate_up[static_cast<size_t>(offset) * gate_columns + i] =
++          bias1[static_cast<size_t>(expert) * gate_columns + i % gate_columns];
++    }
++  }
++  if (bias2) {
++    for (size_t i = threadIdx.x; i < static_cast<size_t>(rows) * hidden_size;
++         i += blockDim.x) {
++      expert_out[static_cast<size_t>(offset) * hidden_size + i] =
++          bias2[static_cast<size_t>(expert) * hidden_size + i % hidden_size];
++    }
++  }
++}
++
++// SwiGLU activation: out = up * silu(gate), where silu(x) = x / (1 + exp(-x)).
++template <Device::Type kDev, typename T>
++__global__ void SwigluKernel(const T* gate_up, T* activated, int rows,
++                             int intermediate_size) {
++  int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  int total = rows * intermediate_size;
++  if (idx >= total) {
++    return;
++  }
++  int row = idx / intermediate_size;
++  int col = idx - row * intermediate_size;
++  const T* base = gate_up + static_cast<size_t>(row) * intermediate_size * 2;
++  float gate = Caster<kDev>::template Cast<float>(base[col]);
++  float up = Caster<kDev>::template Cast<float>(base[intermediate_size + col]);
++  float silu = gate / (1.0f + expf(-gate));
++  activated[idx] = Caster<kDev>::template Cast<T>(up * silu);
++}
++
++// Scatters the weighted expert outputs back to the original token rows. For
++// each token `token`, sums over its `topk` pairs, gathering rows through
++// `output_permutation` and weighting by `topk_weights`.
++template <Device::Type kDev, typename T>
++__global__ void ApplyShuffleMulSumKernel(
++    const T* __restrict__ expert_out, T* __restrict__ out,
++    const int* __restrict__ output_permutation,
++    const float* __restrict__ topk_weights, int num_tokens, int topk,
++    int hidden_size) {
++  int token = blockIdx.x;
++  if (token >= num_tokens) {
++    return;
++  }
++
++  for (int h = threadIdx.x; h < hidden_size; h += blockDim.x) {
++    float sum = 0.0f;
++    for (int k = 0; k < topk; ++k) {
++      int pair = token * topk + k;
++      int src_row = output_permutation[pair];
++      if (src_row >= 0) {
++        sum += Caster<kDev>::template Cast<float>(
++                   expert_out[static_cast<size_t>(src_row) * hidden_size + h]) *
++               topk_weights[pair];
++      }
++    }
++    out[static_cast<size_t>(token) * hidden_size + h] =
++        Caster<kDev>::template Cast<T>(sum);
++  }
++}
++
++}  // namespace moe_fused_dense_detail
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_CUDA_MOE_FUSED_DENSE_KERNEL_CUH_
+diff --git a/src/native/cuda/ops/moe_fused_dense/kernel.h b/src/native/cuda/ops/moe_fused_dense/kernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..58920ce097f16876ffe2cf9b68ccdafd54d29e4c
+--- /dev/null
++++ b/src/native/cuda/ops/moe_fused_dense/kernel.h
+@@ -0,0 +1,334 @@
++#ifndef INFINI_OPS_CUDA_MOE_FUSED_DENSE_KERNEL_H_
++#define INFINI_OPS_CUDA_MOE_FUSED_DENSE_KERNEL_H_
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++#include "base/moe_fused_dense.h"
++#include "data_type.h"
++#include "dispatcher.h"
++#include "native/cuda/ops/moe_fused_dense/kernel.cuh"
++#include "native/cuda/runtime_utils.h"
++
++namespace infini::ops {
++
++// MoE fused-dense reference for CUDA-like backends without a
++// grouped GEMM (e.g. Metax): sorted tokens are packed into
++// per-expert contiguous buckets, one GEMM runs per expert, SwiGLU
++// + the down-projection run, and the weighted results are
++// scattered back to the original tokens.
++//
++// The `Backend` type must expose the CUDA-like runtime members
++// (`Stream`, `Malloc`, `Free`, `Memcpy`, `Memset`,
++// `DeviceSynchronize`, `kMemcpyDeviceToHost`) and the BLAS
++// members used here (`BlasHandle`, `BlasCreate`, `BlasSetStream`,
++// `BlasGemmStridedBatchedEx`, `BLAS_OP_T`, `BLAS_OP_N`, `R_16F`,
++// `R_16BF`, `BLAS_COMPUTE_32F`, `BLAS_GEMM_DEFAULT`).
++template <typename Backend>
++class CudaMoeFusedDense : public MoeFusedDense {
++ public:
++  CudaMoeFusedDense(Tensor output, const Tensor hidden_states, const Tensor w13,
++                    const Tensor w2, const Tensor topk_weights,
++                    const Tensor topk_ids, const Tensor sorted_token_ids,
++                    const Tensor expert_ids,
++                    const Tensor num_tokens_post_padded, size_t block_size,
++                    const std::optional<Tensor> bias1 = std::nullopt,
++                    const std::optional<Tensor> bias2 = std::nullopt)
++      : MoeFusedDense{output,
++                      hidden_states,
++                      w13,
++                      w2,
++                      topk_weights,
++                      topk_ids,
++                      sorted_token_ids,
++                      expert_ids,
++                      num_tokens_post_padded,
++                      block_size,
++                      bias1,
++                      bias2} {
++    moe_detail::Require(
++        hidden_states.IsContiguous() && w13.IsContiguous() &&
++        w2.IsContiguous() && topk_weights.IsContiguous() &&
++        topk_ids.IsContiguous() && sorted_token_ids.IsContiguous() &&
++        expert_ids.IsContiguous() && num_tokens_post_padded.IsContiguous() &&
++        output.IsContiguous());
++    moe_detail::Require(hidden_states.dtype() == DataType::kFloat16 ||
++                        hidden_states.dtype() == DataType::kBFloat16);
++    if (bias1) {
++      moe_detail::Require(bias1->IsContiguous());
++    }
++    if (bias2) {
++      moe_detail::Require(bias2->IsContiguous());
++    }
++  }
++
++  ~CudaMoeFusedDense() override = default;
++
++  std::size_t workspace_size_in_bytes() const override {
++    const auto& metadata_ = MoeFusedDense::metadata_;
++    const auto dtype = metadata_[1].dtype();
++    const std::size_t dtype_size = kDataTypeToSize.at(dtype);
++    const std::size_t num_tokens = metadata_[1].size(0);
++    const std::size_t hidden_size = metadata_[1].size(1);
++    const std::size_t intermediate_size = metadata_[3].size(2);
++    const std::size_t topk = metadata_[5].size(1);
++    const std::size_t max_num_tokens_padded = metadata_[6].numel();
++    const std::size_t pairs = num_tokens * topk;
++    std::size_t bytes = 0;
++    bytes += AlignUp((num_experts() + 1) * sizeof(int));
++    bytes += AlignUp((num_experts() + 1) * sizeof(int));
++    bytes += AlignUp(pairs * sizeof(int));
++    bytes += AlignUp(max_num_tokens_padded * hidden_size * dtype_size);
++    bytes +=
++        AlignUp(max_num_tokens_padded * intermediate_size * 2 * dtype_size);
++    bytes += AlignUp(max_num_tokens_padded * intermediate_size * dtype_size);
++    bytes += AlignUp(max_num_tokens_padded * hidden_size * dtype_size);
++    return bytes;
++  }
++
++  bool capture_safe() const override { return false; }
++
++  void operator()(Tensor output, const Tensor hidden_states, const Tensor w13,
++                  const Tensor w2, const Tensor weights, const Tensor ids,
++                  const Tensor sorted_token_ids, const Tensor expert_ids,
++                  const Tensor num_tokens_post_padded, size_t block_size,
++                  const std::optional<Tensor> bias1,
++                  const std::optional<Tensor> bias2) const override {
++    Invocation(output, hidden_states, w13, w2, weights, ids, sorted_token_ids,
++               expert_ids, num_tokens_post_padded, block_size, bias1, bias2);
++
++    const int num_tokens = static_cast<int>(hidden_states.size(0));
++    const int hidden_size = static_cast<int>(hidden_states.size(1));
++    const int num_experts = static_cast<int>(w13.size(0));
++    const int intermediate_size = static_cast<int>(w2.size(2));
++    const int topk = static_cast<int>(ids.size(1));
++    const int num_tokens_padded = static_cast<int>(sorted_token_ids.numel());
++    const int max_num_tokens_padded =
++        static_cast<int>(sorted_token_ids.numel());
++    const int pairs = num_tokens * topk;
++    const int block_size_i = static_cast<int>(block_size);
++    const std::size_t dtype_size = kDataTypeToSize.at(hidden_states.dtype());
++
++    auto stream = static_cast<typename Backend::Stream>(stream_);
++
++    void* workspace_ptr = workspace_;
++    moe_detail::Require(workspace_ptr != nullptr &&
++                        workspace_size_in_bytes_ >= workspace_size_in_bytes());
++
++    // Workspace layout: counts, offsets, permutation, then data buffers.
++    std::uint8_t* ptr = reinterpret_cast<std::uint8_t*>(workspace_ptr);
++    int* counts = Advance<int>(ptr, num_experts + 1);
++    int* offsets = Advance<int>(ptr, num_experts + 1);
++    int* output_permutation = Advance<int>(ptr, pairs);
++    void* packed_hidden =
++        AdvanceBytes(ptr, static_cast<std::size_t>(num_tokens_padded) *
++                              hidden_size * dtype_size);
++    void* gate_up =
++        AdvanceBytes(ptr, static_cast<std::size_t>(num_tokens_padded) *
++                              intermediate_size * 2 * dtype_size);
++    void* activated =
++        AdvanceBytes(ptr, static_cast<std::size_t>(num_tokens_padded) *
++                              intermediate_size * dtype_size);
++    void* expert_out =
++        AdvanceBytes(ptr, static_cast<std::size_t>(num_tokens_padded) *
++                              hidden_size * dtype_size);
++
++    auto& blas_handle = GetHandle();
++    Backend::BlasSetStream(blas_handle, stream);
++
++    const bool has_bias1 = bias1.has_value();
++    const bool has_bias2 = bias2.has_value();
++
++    Backend::Memset(output_permutation, 0xFF, pairs * sizeof(int));
++    Backend::Memset(counts, 0, (num_experts + 1) * sizeof(int));
++    Backend::Memset(
++        expert_out, 0,
++        static_cast<std::size_t>(num_tokens_padded) * hidden_size * dtype_size);
++
++    // Read num_tokens_post_padded on the host before launching the
++    // counting / packing kernels.
++    int num_tokens_post_padded_host = 0;
++    Backend::Memcpy(&num_tokens_post_padded_host, num_tokens_post_padded.data(),
++                    sizeof(int), Backend::kMemcpyDeviceToHost);
++    int num_blocks_aligned =
++        (num_tokens_post_padded_host + block_size_i - 1) / block_size_i;
++
++    moe_fused_dense_detail::CountAlignedExpertsKernel<<<
++        (num_blocks_aligned + 255) / 256, 256, 0, stream>>>(
++        reinterpret_cast<const int*>(expert_ids.data()),
++        num_tokens_post_padded_host, counts, num_experts, block_size_i);
++    moe_fused_dense_detail::ExclusivePrefixCountsKernel<Backend::kDeviceType>
++        <<<1, 1, 0, stream>>>(counts, offsets, num_experts);
++
++    DispatchFunc<List<DataType::kFloat16, DataType::kBFloat16>>(
++        {static_cast<int64_t>(hidden_states.dtype())},
++        [&](auto type_tag) {
++          using T = TypeMapType<Backend::kDeviceType, ListGet<0>(type_tag)>;
++          moe_fused_dense_detail::PackHiddenAlignedKernel<Backend::kDeviceType,
++                                                          T>
++              <<<num_tokens_padded, 256, 0, stream>>>(
++                  reinterpret_cast<const T*>(hidden_states.data()),
++                  reinterpret_cast<const int*>(sorted_token_ids.data()),
++                  output_permutation, reinterpret_cast<T*>(packed_hidden),
++                  pairs, topk, hidden_size, num_tokens_padded);
++        },
++        "CudaMoeFusedDense::PackHiddenAligned");
++
++    // Per-expert GEMMs launch from the host, so copy counts/offsets
++    // back and wait for the counting / packing kernels as well as the
++    // D2H copies.
++    std::vector<int> host_counts(num_experts + 1);
++    std::vector<int> host_offsets(num_experts + 1);
++    Backend::Memcpy(host_counts.data(), counts, (num_experts + 1) * sizeof(int),
++                    Backend::kMemcpyDeviceToHost);
++    Backend::Memcpy(host_offsets.data(), offsets,
++                    (num_experts + 1) * sizeof(int),
++                    Backend::kMemcpyDeviceToHost);
++    Backend::DeviceSynchronize();
++
++    const auto blas_dtype = (hidden_states.dtype() == DataType::kFloat16)
++                                ? Backend::R_16F
++                                : Backend::R_16BF;
++
++    // Bias rows are written into the packed buffers before each GEMM
++    // so rows the GEMM never touches still receive the bias.
++    if (has_bias1 || has_bias2) {
++      DispatchFunc<List<DataType::kFloat16, DataType::kBFloat16>>(
++          {static_cast<int64_t>(hidden_states.dtype())},
++          [&](auto type_tag) {
++            using T = TypeMapType<Backend::kDeviceType, ListGet<0>(type_tag)>;
++            moe_fused_dense_detail::FillPrefillBiasKernel<
++                Backend::kDeviceType, T><<<num_experts, 256, 0, stream>>>(
++                has_bias1 ? reinterpret_cast<T*>(gate_up) : nullptr,
++                has_bias2 ? reinterpret_cast<T*>(expert_out) : nullptr,
++                has_bias1 ? reinterpret_cast<const T*>(bias1->data()) : nullptr,
++                has_bias2 ? reinterpret_cast<const T*>(bias2->data()) : nullptr,
++                host_counts.data(), host_offsets.data(), intermediate_size,
++                hidden_size);
++          },
++          "CudaMoeFusedDense::FillBias");
++    }
++
++    // GEMM1: gate_up (m x 2*I) = w13^T (2*I x H) @ packed_hidden^T.
++    // w13 is col-major, dimensions (H, 2*I) -> OP_T with lda = H.
++    {
++      const float alpha = 1.0f;
++      const float beta = 0.0f;
++      for (int e = 0; e < num_experts; ++e) {
++        const int m = host_counts[e];
++        if (m <= 0) {
++          continue;
++        }
++        const int off = host_offsets[e];
++        Backend::BlasGemmStridedBatchedEx(
++            blas_handle, Backend::BLAS_OP_T, Backend::BLAS_OP_N,
++            intermediate_size * 2, m, hidden_size, &alpha,
++            reinterpret_cast<const std::uint8_t*>(w13.data()) +
++                static_cast<std::size_t>(e) * intermediate_size * 2 *
++                    hidden_size * dtype_size,
++            blas_dtype, hidden_size, 0,
++            reinterpret_cast<const std::uint8_t*>(packed_hidden) +
++                static_cast<std::size_t>(off) * hidden_size * dtype_size,
++            blas_dtype, hidden_size, 0, &beta,
++            reinterpret_cast<std::uint8_t*>(gate_up) +
++                static_cast<std::size_t>(off) * intermediate_size * 2 *
++                    dtype_size,
++            blas_dtype, intermediate_size * 2, 0, /*batch_count=*/1,
++            Backend::BLAS_COMPUTE_32F, Backend::BLAS_GEMM_DEFAULT);
++      }
++    }
++
++    DispatchFunc<List<DataType::kFloat16, DataType::kBFloat16>>(
++        {static_cast<int64_t>(hidden_states.dtype())},
++        [&](auto type_tag) {
++          using T = TypeMapType<Backend::kDeviceType, ListGet<0>(type_tag)>;
++          moe_fused_dense_detail::SwigluKernel<Backend::kDeviceType, T>
++              <<<num_tokens_padded * intermediate_size / 256 + 1, 256, 0,
++                 stream>>>(reinterpret_cast<const T*>(gate_up),
++                           reinterpret_cast<T*>(activated), num_tokens_padded,
++                           intermediate_size);
++        },
++        "CudaMoeFusedDense::Swiglu");
++
++    // GEMM2: expert_out (m x H) = w2^T (H x I) @ activated^T.
++    // w2 is col-major, dimensions (I, H) -> OP_T with lda = I.
++    {
++      const float alpha = 1.0f;
++      const float beta = 0.0f;
++      for (int e = 0; e < num_experts; ++e) {
++        const int m = host_counts[e];
++        if (m <= 0) {
++          continue;
++        }
++        const int off = host_offsets[e];
++        Backend::BlasGemmStridedBatchedEx(
++            blas_handle, Backend::BLAS_OP_T, Backend::BLAS_OP_N, hidden_size, m,
++            intermediate_size, &alpha,
++            reinterpret_cast<const std::uint8_t*>(w2.data()) +
++                static_cast<std::size_t>(e) * hidden_size * intermediate_size *
++                    dtype_size,
++            blas_dtype, intermediate_size, 0,
++            reinterpret_cast<const std::uint8_t*>(activated) +
++                static_cast<std::size_t>(off) * intermediate_size * dtype_size,
++            blas_dtype, intermediate_size, 0, &beta,
++            reinterpret_cast<std::uint8_t*>(expert_out) +
++                static_cast<std::size_t>(off) * hidden_size * dtype_size,
++            blas_dtype, hidden_size, 0, /*batch_count=*/1,
++            Backend::BLAS_COMPUTE_32F, Backend::BLAS_GEMM_DEFAULT);
++      }
++    }
++
++    DispatchFunc<List<DataType::kFloat16, DataType::kBFloat16>>(
++        {static_cast<int64_t>(hidden_states.dtype())},
++        [&](auto type_tag) {
++          using T = TypeMapType<Backend::kDeviceType, ListGet<0>(type_tag)>;
++          moe_fused_dense_detail::ApplyShuffleMulSumKernel<Backend::kDeviceType,
++                                                           T>
++              <<<num_tokens, std::min(hidden_size, 1024), 0, stream>>>(
++                  reinterpret_cast<const T*>(expert_out),
++                  reinterpret_cast<T*>(output.data()), output_permutation,
++                  reinterpret_cast<const float*>(weights.data()), num_tokens,
++                  topk, hidden_size);
++        },
++        "CudaMoeFusedDense::ApplyShuffleMulSum");
++  }
++
++ protected:
++  static std::size_t AlignUp(std::size_t value, std::size_t alignment = 16) {
++    return (value + alignment - 1) / alignment * alignment;
++  }
++
++  template <typename T>
++  static T* Advance(std::uint8_t*& ptr, std::size_t count) {
++    T* out = reinterpret_cast<T*>(ptr);
++    ptr += AlignUp(count * sizeof(T));
++    return out;
++  }
++
++  static void* AdvanceBytes(std::uint8_t*& ptr, std::size_t bytes) {
++    void* out = reinterpret_cast<void*>(ptr);
++    ptr += AlignUp(bytes);
++    return out;
++  }
++
++  static typename Backend::BlasHandle& GetHandle() {
++    thread_local typename Backend::BlasHandle handle = []() {
++      typename Backend::BlasHandle h;
++      Backend::BlasCreate(&h);
++      return h;
++    }();
++    return handle;
++  }
++
++ private:
++  std::size_t num_experts() const {
++    return MoeFusedDense::metadata_[2].size(0);
++  }
++};
++
++}  // namespace infini::ops
++
++#endif  // INFINI_OPS_CUDA_MOE_FUSED_DENSE_KERNEL_H_

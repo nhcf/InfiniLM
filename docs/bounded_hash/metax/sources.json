@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "infinilm": {
+    "upstream_base": "df54bf0e621595cea9dd57eb4ebb508918127967",
+    "pr616_head": "581eeaab4db5e60954bf61382f3576a937753f4d",
+    "pr616_original_patch_sha256": "63c1e08bb924368568716c34a423c3bc7c98dfca44a5c88f7ab289ce8e153ae3",
+    "pr616_integration": "12e90ce31215a51ef34a0c756fd28b5d880cb516",
+    "original_v3": "c6f1005f3e81d0799229d66bb6db6c37f1d257ac",
+    "tested_b_parent": "82b5687a513778eaec4f3f23664bf4a2189847af"
+  },
+  "dependencies": {
+    "third_party/InfiniCore": {
+      "url": "https://github.com/InfiniTensor/InfiniCore.git",
+      "public_commit": "a87cefa2e96b3a1112b329685c852d9ee46e5c84",
+      "tested_commit": "a87cefa2e96b3a1112b329685c852d9ee46e5c84",
+      "tested_tree": "e1ab8186c3e1914668874eaf870d1d6148ed6ac5"
+    },
+    "third_party/InfiniCore/submodules/InfiniRT": {
+      "url": "https://github.com/InfiniTensor/InfiniRT.git",
+      "public_commit": "cd1d48258f0a6b8d9f66111d5d6cb1664205e78d",
+      "tested_commit": "cd1d48258f0a6b8d9f66111d5d6cb1664205e78d",
+      "tested_tree": "64567a7f9a657021c27afcf6cb7ae48606ce2035"
+    },
+    "third_party/InfiniCore/submodules/InfiniOps": {
+      "url": "https://github.com/InfiniTensor/InfiniOps.git",
+      "public_commit": "a4b11fb3730d0d39a93072abfe17925671b9d402",
+      "tested_commit": "423ba98eb779545b6d2086bf0c3cfc8f85654b41",
+      "tested_tree": "f1617e0850ef0319702def4807bf17a23ebf3def"
+    },
+    "third_party/InfiniCore/submodules/InfiniCCL": {
+      "url": "https://github.com/InfiniTensor/InfiniCCL.git",
+      "public_commit": "51cc9db31d58aac21643d72f0f77cf5c9ecfaee5",
+      "tested_commit": "51cc9db31d58aac21643d72f0f77cf5c9ecfaee5",
+      "tested_tree": "63e64ddd93ab861cf429250e48ded7f50d027cda"
+    },
+    "third_party/InfiniCore/submodules/InfiniOps/.ci": {
+      "url": "https://github.com/InfiniTensor/ci.git",
+      "public_commit": "b45d360c8cc529747ee31c5451d7eac96ac9f309",
+      "tested_commit": "b45d360c8cc529747ee31c5451d7eac96ac9f309",
+      "tested_tree": "9ac0f51b762ba36c1dda3a436c353135db6f65b5"
+    },
+    "third_party/json": {
+      "url": "https://github.com/nlohmann/json.git",
+      "public_commit": "5ed07097faa6c50199c4a3b66e5ed37d4fbfccc2",
+      "tested_commit": "5ed07097faa6c50199c4a3b66e5ed37d4fbfccc2",
+      "tested_tree": "4be277b59cb8e7fe56ad688441436e17943fcca3"
+    },
+    "third_party/spdlog": {
+      "url": "https://github.com/gabime/spdlog.git",
+      "public_commit": "88a0e07ad5bb3e2651cd5613530b3f06a15fc400",
+      "tested_commit": "88a0e07ad5bb3e2651cd5613530b3f06a15fc400",
+      "tested_tree": "32b2ccf21f3edbad36d657a0245422608185d1e8"
+    }
+  },
+  "infiniops": {
+    "pr1033_base": "e4ec0c3774d971b3e68e75a1f5ef40ec4577f593",
+    "pr1033_head": "a6213df839ca8d96509d9b4edaa8872273c76260",
+    "pr1033_original_patch_sha256": "84efb2dd4e25bf7a23bfd08149c700bf74503d2e6480d0c883a0da450d6113cf",
+    "apply_in_order": [
+      {
+        "path": "patches/0001-metax-operators-pr1033.patch",
+        "tested_commit": "5065e6342f6c6923db759846aa09a753c54525ff",
+        "tree_after_patch": "1e6bece5f3268ade0974cc130233a53cd3acf839",
+        "sha256": "324709ca681e1ac94dee5b35f10922ee69875490f2e4402d1e3fd78cb14daad4"
+      },
+      {
+        "path": "patches/0002-metax-linked-torch-host-adapters.patch",
+        "tested_commit": "75000f70a415aa198de5c9578c9d89cc468a792e",
+        "tree_after_patch": "6455232f9e72e684c04fa1542823f34d1bf27af6",
+        "sha256": "c27773fa2a0b1abeebb74b5dd2cc1283e8957f1b64c896fb024812ea8052aec7"
+      },
+      {
+        "path": "patches/0003-metax-separate-rope-and-python-embed.patch",
+        "tested_commit": "423ba98eb779545b6d2086bf0c3cfc8f85654b41",
+        "tree_after_patch": "f1617e0850ef0319702def4807bf17a23ebf3def",
+        "sha256": "9d6753deb6f4c68c5fbf67674594c008cfa3631626b3bc1dab74bf37f8b79abe"
+      }
+    ]
+  },
+  "historical_runs": {
+    "abc_8b": {
+      "id": "run_20261117T002027Z",
+      "frozen_sha256": "be2c7ee3298553c9a72bd54e72a86b4a69d2b6ec34958f73484b34a4abefa7d7",
+      "source_lock_sha256": "9fe5c541088090ca9c81997934e54372bbad4aed89ea2c01c3ac2ad0b5c867ba",
+      "build_sha256": "1ea1a8532bcca69b80c3fc3652a3b2e852e91a867773958e111e6b93d112b8c2",
+      "delivery_sha256": "4cf3b790b1d278cf36691eb8aadbe87cbb5c349c38bfbb335f885d01d00a0190"
+    },
+    "db_prefix_lru": {
+      "id": "rr_prefix_lru_ablation_20261117T062646Z",
+      "frozen_sha256": "78939f513d107963de600cac6fdab16f7fdeac9b01beab265f757f1f13467d2a",
+      "source_lock_sha256": "d98c623d4f3514a5038b75c34afb7bd4ab96c4e51a541f6068aa6b6cf7f7d639",
+      "arm_diff_sha256": "fc5f82f64ff6f2f479945527af3cb79c77f6e852ecbad59aa98b5b4e8914902f",
+      "routing_delta_patch_sha256": "c91730c6e426d7259aa6243aedcfe67059b0619917709ecf1db17595a953ff6c",
+      "delivery_sha256": "c71d20f8baafca2524b2b655653741c25a7730bd8a8d2f1d7c56453b582a8354",
+      "cost_sha256": "26a36e34a10cf0eb679376fb1eeb45b6a02e4e40dc71b4d9640ef81c2fe05e0a",
+      "runtime_source_sha256": {
+        "python/infinilm/server/bounded_hash_gateway.py": "4649fab9765896978ecab56f9cd83738d6434906b36858dac8ec9c351b2e0155",
+        "python/infinilm/server/bounded_hash_config.py": "c8c3d09bef565ca87a2284bfd3db2246020db2dda0249ab5d831ade427d7856e",
+        "python/infinilm/routing/bounded_hash/round_robin_router.py": "e54886061ce9885ee1e4935d4b8dcfd2cb0ad0d2aad509b95d97e270539396c9",
+        "python/infinilm/routing/bounded_hash/cache_router_v3.py": "86c7e2902eb84cfc8207824d09a7d21f4d9379972602952dd400b33fdc7fc34b",
+        "python/infinilm/routing/bounded_hash/cache_router.py": "36712d093bc2f54ca2a1689223e2dd8e494cdf1c89b1aeb9573bd8b9c0dee8da",
+        "python/infinilm/routing/bounded_hash/affinity_router.py": "322c5cddb1e1e8df8f36aa49a4e4fa884d082747d0b9095a69eee99dd5d421a2",
+        "python/infinilm/llm/cache_manager.py": "054d59de3824b24e674ed948efa7c219c72eec9f39e9820214a29777d9dd4b84",
+        "python/infinilm/llm/prefix_cache.py": "584367fd1d5a46932a5a9a96247091664071ec4e1d1fa21749a49fc23f248fa1",
+        "python/infinilm/llm/scheduler.py": "78f751bb2f4ceeb70c3b138722e91e98c101adf8b351737f6dd182c9208a4273",
+        "python/infinilm/server/bounded_hash_backend.py": "694c9cc95e4fe9d47ba17c8a4a6c3a566d65cfbde7fda39ff5f35684bde5f82a"
+      }
+    },
+    "independent_audit": {
+      "id": "trust_audit_20261117T075303Z",
+      "report_sha256": "9826d0ffef8964ef56bbee13cf25d68c8f1af3c2cc209e733206eb3734e57ade"
+    }
+  },
+  "metax_runtime_used": {
+    "sdk_version": "3.5.3.20",
+    "driver_version": "3.8.30",
+    "python_version": "3.12.11",
+    "cxx11_abi": true,
+    "vendor_packages": {
+      "torch": {
+        "version": "2.8.0+metax3.5.3.9",
+        "wheel_sha256": "867a9638f105bc6cd0de6d2c847142bb133576a974db24f2adb6a9e99d32542d"
+      },
+      "mcoplib": {
+        "version": "0.4.0+maca3.5.3.18.torch2.8",
+        "wheel_sha256": "c36e34fefe27234a7a25910aa4900c4d4713467c46486d8bf354afa45ae46e68"
+      },
+      "flash-attn": {
+        "version": "2.6.3+metax3.5.3.9torch2.8",
+        "wheel_sha256": "5148a15dd1911e5afb8c5348b47568ddfe6baef684590752c273aa0b02f3062e"
+      }
+    }
+  }
+}

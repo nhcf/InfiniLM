@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Incomplete illustration only. Null coefficients are invalid; supply independent deployment measurements, not historical V3 numbers.",
+  "description": "Incomplete deployment example. Use the deployed backend identity and independently measured coefficients.",
   "compatibility": {
     "identity": null,
     "page_size": 256,
@@ -10,8 +10,20 @@
   },
   "phase_model": {
     "schema_version": 1,
-    "prefill_coef": [null, null, null],
-    "decode_step_ms": {"1": null, "2": null, "3": null},
-    "decode_context_tokens": {"1": null, "2": null, "3": null}
+    "prefill_coef": [
+      null,
+      null,
+      null
+    ],
+    "decode_step_ms": {
+      "1": null,
+      "2": null,
+      "3": null
+    },
+    "decode_context_tokens": {
+      "1": null,
+      "2": null,
+      "3": null
+    }
   }
 }

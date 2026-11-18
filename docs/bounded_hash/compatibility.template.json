@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "compatibility": {
+    "identity": null,
+    "page_size": 256,
+    "kv_tokens": 32768,
+    "cache_policy": "prefix_lru",
+    "max_inflight": 3
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "routing_policy": "round_robin",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "state_lock": "gateway.state.lock",
+  "contract_compatibility_file": "compatibility.deployment.json",
+  "page_size": 256,
+  "kv_tokens": 32768,
+  "max_inflight": 3,
+  "queue_timeout_s": 1800,
+  "request_timeout_s": 1800,
+  "prefix_tokens": 7936,
+  "cache_policy": "prefix_lru",
+  "expected_request": {
+    "prompt_tokens": 8192,
+    "output_tokens": 32,
+    "shared_tokens": 7936
+  },
+  "backends": [
+    {
+      "url": "http://replica-1.example.invalid:8000",
+      "key_env": "INFINILM_REPLICA_KEY"
+    },
+    {
+      "url": "http://replica-2.example.invalid:8001",
+      "key_env": "INFINILM_REPLICA_KEY"
+    }
+  ]
+}

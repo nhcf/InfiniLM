@@ -1,0 +1,1078 @@
+From 75000f70a415aa198de5c9578c9d89cc468a792e Mon Sep 17 00:00:00 2001
+From: Codex <codex@local.invalid>
+Date: Tue, 17 Nov 2026 09:01:27 +0800
+Subject: [PATCH] fix(metax): isolate linked Torch host implementations from
+ GPU dispatch
+
+
+diff --git a/src/linked/torch/cambricon/ops/rms_norm/apex.cc b/src/linked/torch/cambricon/ops/rms_norm/apex.cc
+index 432370251704cbff5f21bbf28fc391c5a201fce1..ac2684f837b83c92a4e3e7170816935fc4089493 100644
+--- a/src/linked/torch/cambricon/ops/rms_norm/apex.cc
++++ b/src/linked/torch/cambricon/ops/rms_norm/apex.cc
+@@ -1,3 +1,4 @@
++#include "linked/torch/ops/rms_norm_impl.h"
+ #include "linked/torch/cambricon/ops/rms_norm/apex.h"
+
+ // Cambricon Apex `fused_layer_norm_cuda` exports this global C++ symbol.
+diff --git a/src/linked/torch/cambricon/ops/silu_and_mul/apex.cc b/src/linked/torch/cambricon/ops/silu_and_mul/apex.cc
+index 4d02a2ff51c036fbb4db3fa1e0fb9b57a2e7e32a..19ea10a082da5ab17ed3724d765f7510d2ef23cd 100644
+--- a/src/linked/torch/cambricon/ops/silu_and_mul/apex.cc
++++ b/src/linked/torch/cambricon/ops/silu_and_mul/apex.cc
+@@ -1,3 +1,4 @@
++#include "linked/torch/ops/silu_and_mul_impl.h"
+ #include "linked/torch/cambricon/ops/silu_and_mul/apex.h"
+
+ // Cambricon Apex glu_activation exports this global C++ symbol.
+diff --git a/src/linked/torch/metax/ops/layer_norm/aten.cc b/src/linked/torch/metax/ops/layer_norm/aten.cc
+index e656967b9f84ade0126d0d09f1f21e5917171d3d..bfeef1e84eec9dce9704387b532370ce8b4e38b4 100644
+--- a/src/linked/torch/metax/ops/layer_norm/aten.cc
++++ b/src/linked/torch/metax/ops/layer_norm/aten.cc
+@@ -1,3 +1,13 @@
++#include "linked/torch/ops/layer_norm_impl.h"
++#include <ATen/ops/native_layer_norm.h>
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct AtenLayerNorm : C10<Device::Type::kMetax> {};
++
++}  // namespace infini::ops::linked::torch::metax
++
+ #include "linked/torch/metax/ops/layer_norm/aten.h"
+
+ namespace infini::ops::linked::torch {
+diff --git a/src/linked/torch/metax/ops/layer_norm/aten.h b/src/linked/torch/metax/ops/layer_norm/aten.h
+index fc3c0278764a808e7c58c23d5b3f0d29e0425af2..680443927e3ef172be0676f3aa9d4ad30f3d3adc 100644
+--- a/src/linked/torch/metax/ops/layer_norm/aten.h
++++ b/src/linked/torch/metax/ops/layer_norm/aten.h
+@@ -1,14 +1,12 @@
+ #ifndef INFINI_OPS_LINKED_TORCH_METAX_OPS_LAYER_NORM_ATEN_H_
+ #define INFINI_OPS_LINKED_TORCH_METAX_OPS_LAYER_NORM_ATEN_H_
+
+-#include <ATen/ops/native_layer_norm.h>
+
+ #include "linked/torch/ops/layer_norm.h"
+-#include "torch/metax/c10.h"
+
+ namespace infini::ops::linked::torch::metax {
+
+-struct AtenLayerNorm : C10<Device::Type::kMetax> {};
++struct AtenLayerNorm;
+
+ }  // namespace infini::ops::linked::torch::metax
+
+diff --git a/src/linked/torch/metax/ops/moe_align_block_size/vllm.cc b/src/linked/torch/metax/ops/moe_align_block_size/vllm.cc
+index 4d2f7172c2af5107dc4ca4ebba8758b8d5f14011..2e831be9ca20acab0bd86509237c8495708dd580 100644
+--- a/src/linked/torch/metax/ops/moe_align_block_size/vllm.cc
++++ b/src/linked/torch/metax/ops/moe_align_block_size/vllm.cc
+@@ -1,3 +1,39 @@
++#include "linked/torch/ops/moe_align_block_size_impl.h"
++#include <ATen/core/dispatch/Dispatcher.h>
++#include <ATen/core/stack.h>
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct VllmMoeAlignBlockSize : C10<Device::Type::kMetax> {
++  static void Call(at::Tensor topk_ids, int64_t num_experts, int64_t block_size,
++                   at::Tensor sorted_token_ids, at::Tensor experts_ids,
++                   at::Tensor num_tokens_post_pad,
++                   std::optional<at::Tensor> maybe_expert_map) {
++    static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
++        "_moe_C::moe_align_block_size", "");
++    c10::Stack stack;
++    stack.reserve(7);
++    stack.emplace_back(std::move(topk_ids));
++    stack.emplace_back(num_experts);
++    stack.emplace_back(block_size);
++    stack.emplace_back(std::move(sorted_token_ids));
++    stack.emplace_back(std::move(experts_ids));
++    stack.emplace_back(std::move(num_tokens_post_pad));
++    if (maybe_expert_map.has_value()) {
++      stack.emplace_back(std::move(*maybe_expert_map));
++    } else {
++      stack.emplace_back();
++    }
++    op.callBoxed(&stack);
++
++    assert(stack.empty() &&
++           "`moe_align_block_size` returned an unexpected number of values");
++  }
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
+ #include "linked/torch/metax/ops/moe_align_block_size/vllm.h"
+
+ namespace infini::ops::linked::torch {
+diff --git a/src/linked/torch/metax/ops/moe_align_block_size/vllm.h b/src/linked/torch/metax/ops/moe_align_block_size/vllm.h
+index 3e5d5603973ae4fb62114e3499a2bcd5015f3adb..fdd5f327a51a7218596c20eb5e8b0523f6e4a40d 100644
+--- a/src/linked/torch/metax/ops/moe_align_block_size/vllm.h
++++ b/src/linked/torch/metax/ops/moe_align_block_size/vllm.h
+@@ -1,43 +1,15 @@
+ #ifndef INFINI_OPS_LINKED_TORCH_METAX_OPS_MOE_ALIGN_BLOCK_SIZE_VLLM_H_
+ #define INFINI_OPS_LINKED_TORCH_METAX_OPS_MOE_ALIGN_BLOCK_SIZE_VLLM_H_
+
+-#include <ATen/core/dispatch/Dispatcher.h>
+-#include <ATen/core/stack.h>
+
+ #include <cassert>
+ #include <utility>
+
+ #include "linked/torch/ops/moe_align_block_size.h"
+-#include "torch/metax/c10.h"
+
+ namespace infini::ops::linked::torch::metax {
+
+-struct VllmMoeAlignBlockSize : C10<Device::Type::kMetax> {
+-  static void Call(at::Tensor topk_ids, int64_t num_experts, int64_t block_size,
+-                   at::Tensor sorted_token_ids, at::Tensor experts_ids,
+-                   at::Tensor num_tokens_post_pad,
+-                   std::optional<at::Tensor> maybe_expert_map) {
+-    static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
+-        "_moe_C::moe_align_block_size", "");
+-    c10::Stack stack;
+-    stack.reserve(7);
+-    stack.emplace_back(std::move(topk_ids));
+-    stack.emplace_back(num_experts);
+-    stack.emplace_back(block_size);
+-    stack.emplace_back(std::move(sorted_token_ids));
+-    stack.emplace_back(std::move(experts_ids));
+-    stack.emplace_back(std::move(num_tokens_post_pad));
+-    if (maybe_expert_map.has_value()) {
+-      stack.emplace_back(std::move(*maybe_expert_map));
+-    } else {
+-      stack.emplace_back();
+-    }
+-    op.callBoxed(&stack);
+-
+-    assert(stack.empty() &&
+-           "`moe_align_block_size` returned an unexpected number of values");
+-  }
+-};
++struct VllmMoeAlignBlockSize;
+
+ }  // namespace infini::ops::linked::torch::metax
+
+diff --git a/src/linked/torch/metax/ops/pad/aten.cc b/src/linked/torch/metax/ops/pad/aten.cc
+index 1426d31634f2ae4b5086199f0a38d17b1374ef75..547de87c5973cfde41dea9560f5cb2d5a2032b40 100644
+--- a/src/linked/torch/metax/ops/pad/aten.cc
++++ b/src/linked/torch/metax/ops/pad/aten.cc
+@@ -1,3 +1,29 @@
++#include "linked/torch/ops/pad_impl.h"
++#include <ATen/core/dispatch/Dispatcher.h>
++#include <ATen/core/stack.h>
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct AtenPad : C10<Device::Type::kMetax> {
++  static void Call(at::Tensor out, at::Tensor input, std::vector<int64_t> pad,
++                   double value) {
++    static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
++        "aten::constant_pad_nd", "");
++    c10::Stack stack;
++    stack.reserve(4);
++    stack.emplace_back(std::move(input));
++    stack.emplace_back(c10::List<int64_t>(pad));
++    stack.emplace_back(value);
++    op.callBoxed(&stack);
++    TORCH_CHECK(stack.size() == 1,
++                "`constant_pad_nd` returned unexpected values.");
++    out.copy_(stack.front().toTensor());
++  }
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
+ #include "linked/torch/metax/ops/pad/aten.h"
+
+ namespace infini::ops::linked::torch {
+diff --git a/src/linked/torch/metax/ops/pad/aten.h b/src/linked/torch/metax/ops/pad/aten.h
+index 50164fe53f7e2b479e73ada68b594905702affd4..5651f9490573a028d5c4203738e47bfd4af676f6 100644
+--- a/src/linked/torch/metax/ops/pad/aten.h
++++ b/src/linked/torch/metax/ops/pad/aten.h
+@@ -1,34 +1,16 @@
+ #ifndef INFINI_OPS_LINKED_TORCH_METAX_OPS_PAD_ATEN_H_
+ #define INFINI_OPS_LINKED_TORCH_METAX_OPS_PAD_ATEN_H_
+
+-#include <ATen/core/dispatch/Dispatcher.h>
+-#include <ATen/core/stack.h>
+
+ #include <cassert>
+ #include <optional>
+ #include <vector>
+
+ #include "linked/torch/ops/pad.h"
+-#include "torch/metax/c10.h"
+
+ namespace infini::ops::linked::torch::metax {
+
+-struct AtenPad : C10<Device::Type::kMetax> {
+-  static void Call(at::Tensor out, at::Tensor input, std::vector<int64_t> pad,
+-                   double value) {
+-    static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
+-        "aten::constant_pad_nd", "");
+-    c10::Stack stack;
+-    stack.reserve(4);
+-    stack.emplace_back(std::move(input));
+-    stack.emplace_back(c10::List<int64_t>(pad));
+-    stack.emplace_back(value);
+-    op.callBoxed(&stack);
+-    TORCH_CHECK(stack.size() == 1,
+-                "`constant_pad_nd` returned unexpected values.");
+-    out.copy_(stack.front().toTensor());
+-  }
+-};
++struct AtenPad;
+
+ }  // namespace infini::ops::linked::torch::metax
+
+diff --git a/src/linked/torch/metax/ops/quick_gelu/vllm.cc b/src/linked/torch/metax/ops/quick_gelu/vllm.cc
+index 4b4e19a5bf23d5b8e51e2d75d491823d7142843c..ef274eef001892c5c9ec8c397fe233a13da29c1d 100644
+--- a/src/linked/torch/metax/ops/quick_gelu/vllm.cc
++++ b/src/linked/torch/metax/ops/quick_gelu/vllm.cc
+@@ -1,3 +1,14 @@
++#include "linked/torch/ops/quick_gelu_impl.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct VllmQuickGelu : C10<Device::Type::kMetax> {
++  static void Call(at::Tensor& out, at::Tensor& input);
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
+ #include "linked/torch/metax/ops/quick_gelu/vllm.h"
+
+ // MetaX vLLM `_C` exports this global C++ symbol.
+diff --git a/src/linked/torch/metax/ops/quick_gelu/vllm.h b/src/linked/torch/metax/ops/quick_gelu/vllm.h
+index ae3c4ddbcaa2b99dbdd5dcabd22e8e73caddf40e..c1e99c2c7bf6e6a7414cbaee81a9e8662a7d4855 100644
+--- a/src/linked/torch/metax/ops/quick_gelu/vllm.h
++++ b/src/linked/torch/metax/ops/quick_gelu/vllm.h
+@@ -2,13 +2,10 @@
+ #define INFINI_OPS_LINKED_TORCH_METAX_OPS_QUICK_GELU_VLLM_H_
+
+ #include "linked/torch/ops/quick_gelu.h"
+-#include "torch/metax/c10.h"
+
+ namespace infini::ops::linked::torch::metax {
+
+-struct VllmQuickGelu : C10<Device::Type::kMetax> {
+-  static void Call(at::Tensor& out, at::Tensor& input);
+-};
++struct VllmQuickGelu;
+
+ }  // namespace infini::ops::linked::torch::metax
+
+diff --git a/src/linked/torch/metax/ops/rms_norm/vllm.cc b/src/linked/torch/metax/ops/rms_norm/vllm.cc
+index d68453ec3dd21014388c505aaadff474019274e0..c3cdcc583ebebbb6d50daa6dc78c0fd4b2d50e39 100644
+--- a/src/linked/torch/metax/ops/rms_norm/vllm.cc
++++ b/src/linked/torch/metax/ops/rms_norm/vllm.cc
+@@ -1,3 +1,15 @@
++#include "linked/torch/ops/rms_norm_impl.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct VllmRmsNorm : C10<Device::Type::kMetax> {
++  static void Call(at::Tensor& out, at::Tensor& input, at::Tensor& weight,
++                   double epsilon);
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
+ #include "linked/torch/metax/ops/rms_norm/vllm.h"
+
+ // MetaX vLLM `_C` exports this global C++ symbol.
+diff --git a/src/linked/torch/metax/ops/rms_norm/vllm.h b/src/linked/torch/metax/ops/rms_norm/vllm.h
+index 3b81e51a7e24cbaf3391932b850cbab8c9d478a9..7ee16404d315c855a7bcba9ee350355571f36414 100644
+--- a/src/linked/torch/metax/ops/rms_norm/vllm.h
++++ b/src/linked/torch/metax/ops/rms_norm/vllm.h
+@@ -2,14 +2,10 @@
+ #define INFINI_OPS_LINKED_TORCH_METAX_OPS_RMS_NORM_VLLM_H_
+
+ #include "linked/torch/ops/rms_norm.h"
+-#include "torch/metax/c10.h"
+
+ namespace infini::ops::linked::torch::metax {
+
+-struct VllmRmsNorm : C10<Device::Type::kMetax> {
+-  static void Call(at::Tensor& out, at::Tensor& input, at::Tensor& weight,
+-                   double epsilon);
+-};
++struct VllmRmsNorm;
+
+ }  // namespace infini::ops::linked::torch::metax
+
+diff --git a/src/linked/torch/metax/ops/silu_and_mul/vllm.cc b/src/linked/torch/metax/ops/silu_and_mul/vllm.cc
+index afca929a43cbac6148b5a600e925810a725eddf4..58fcf704bea3e9edc783c10b23229d409801dda1 100644
+--- a/src/linked/torch/metax/ops/silu_and_mul/vllm.cc
++++ b/src/linked/torch/metax/ops/silu_and_mul/vllm.cc
+@@ -1,3 +1,14 @@
++#include "linked/torch/ops/silu_and_mul_impl.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct VllmSiluAndMul : C10<Device::Type::kMetax> {
++  static void Call(at::Tensor& out, at::Tensor& input);
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
+ #include "linked/torch/metax/ops/silu_and_mul/vllm.h"
+
+ // MetaX vLLM `_C` exports this global C++ symbol.
+diff --git a/src/linked/torch/metax/ops/silu_and_mul/vllm.h b/src/linked/torch/metax/ops/silu_and_mul/vllm.h
+index b7fb695b509f2c7d2007dc36761bdc92d156a3eb..597463a0ddf78dc79fa593513553e8e4d8ce28cb 100644
+--- a/src/linked/torch/metax/ops/silu_and_mul/vllm.h
++++ b/src/linked/torch/metax/ops/silu_and_mul/vllm.h
+@@ -2,13 +2,10 @@
+ #define INFINI_OPS_LINKED_TORCH_METAX_OPS_SILU_AND_MUL_VLLM_H_
+
+ #include "linked/torch/ops/silu_and_mul.h"
+-#include "torch/metax/c10.h"
+
+ namespace infini::ops::linked::torch::metax {
+
+-struct VllmSiluAndMul : C10<Device::Type::kMetax> {
+-  static void Call(at::Tensor& out, at::Tensor& input);
+-};
++struct VllmSiluAndMul;
+
+ }  // namespace infini::ops::linked::torch::metax
+
+diff --git a/src/linked/torch/metax/ops/topk_sigmoid/vllm.cc b/src/linked/torch/metax/ops/topk_sigmoid/vllm.cc
+index eb8aaa1dff37ba6426ad18407c005a4b455e27ad..35dd03e13837ea439aa1574130fe210aa8c0374f 100644
+--- a/src/linked/torch/metax/ops/topk_sigmoid/vllm.cc
++++ b/src/linked/torch/metax/ops/topk_sigmoid/vllm.cc
+@@ -1,3 +1,18 @@
++#include "linked/torch/ops/topk_sigmoid_impl.h"
++#include "torch/metax/c10.h"
++
++namespace infini::ops::linked::torch::metax {
++
++struct VllmTopkSigmoid : C10<Device::Type::kMetax> {
++  static void Validate(bool has_is_padding, double routed_scaling_factor);
++
++  static void Call(at::Tensor topk_weights, at::Tensor topk_indices,
++                   at::Tensor token_expert_indices, at::Tensor gating_output,
++                   bool renormalize, std::optional<at::Tensor> bias);
++};
++
++}  // namespace infini::ops::linked::torch::metax
++
+ #include "linked/torch/metax/ops/topk_sigmoid/vllm.h"
+
+ #include <ATen/core/dispatch/Dispatcher.h>
+diff --git a/src/linked/torch/metax/ops/topk_sigmoid/vllm.h b/src/linked/torch/metax/ops/topk_sigmoid/vllm.h
+index 42705a4ad81d96ff13ef4ead1cf64c32caa43cb6..7edc7ce5cb95bd9edf17699612d5ecb747723972 100644
+--- a/src/linked/torch/metax/ops/topk_sigmoid/vllm.h
++++ b/src/linked/torch/metax/ops/topk_sigmoid/vllm.h
+@@ -4,17 +4,10 @@
+ #include <optional>
+
+ #include "linked/torch/ops/topk_sigmoid.h"
+-#include "torch/metax/c10.h"
+
+ namespace infini::ops::linked::torch::metax {
+
+-struct VllmTopkSigmoid : C10<Device::Type::kMetax> {
+-  static void Validate(bool has_is_padding, double routed_scaling_factor);
+-
+-  static void Call(at::Tensor topk_weights, at::Tensor topk_indices,
+-                   at::Tensor token_expert_indices, at::Tensor gating_output,
+-                   bool renormalize, std::optional<at::Tensor> bias);
+-};
++struct VllmTopkSigmoid;
+
+ }  // namespace infini::ops::linked::torch::metax
+
+diff --git a/src/linked/torch/moore/ops/rms_norm/vllm.cc b/src/linked/torch/moore/ops/rms_norm/vllm.cc
+index 2adf2f76ed870ff8b492cb2711a9547450e03e1a..3851dde66f193e888b289da703489ebddb54d9a2 100644
+--- a/src/linked/torch/moore/ops/rms_norm/vllm.cc
++++ b/src/linked/torch/moore/ops/rms_norm/vllm.cc
+@@ -1,3 +1,4 @@
++#include "linked/torch/ops/rms_norm_impl.h"
+ #include "linked/torch/moore/ops/rms_norm/vllm.h"
+
+ // Moore vLLM `_C` exports this global C++ symbol.
+diff --git a/src/linked/torch/moore/ops/silu_and_mul/vllm.cc b/src/linked/torch/moore/ops/silu_and_mul/vllm.cc
+index 1e03d22e07bff8c10399465a4704806ac3db60e5..4dbe37d45a6f03d39f48374d20b5c00cbc1015bc 100644
+--- a/src/linked/torch/moore/ops/silu_and_mul/vllm.cc
++++ b/src/linked/torch/moore/ops/silu_and_mul/vllm.cc
+@@ -1,3 +1,4 @@
++#include "linked/torch/ops/silu_and_mul_impl.h"
+ #include "linked/torch/moore/ops/silu_and_mul/vllm.h"
+
+ // Moore vLLM `_C` exports this global C++ symbol.
+diff --git a/src/linked/torch/nvidia/ops/topk_sigmoid/vllm.cc b/src/linked/torch/nvidia/ops/topk_sigmoid/vllm.cc
+index b2dc2bb79852e2a6d41b32645f1c42a60c0cec98..d480ae7a07dc76f7dde0103204f8bfea52b62aca 100644
+--- a/src/linked/torch/nvidia/ops/topk_sigmoid/vllm.cc
++++ b/src/linked/torch/nvidia/ops/topk_sigmoid/vllm.cc
+@@ -1,3 +1,4 @@
++#include "linked/torch/ops/topk_sigmoid_impl.h"
+ #include "linked/torch/nvidia/ops/topk_sigmoid/vllm.h"
+
+ #include <ATen/core/dispatch/Dispatcher.h>
+diff --git a/src/linked/torch/ops/layer_norm.h b/src/linked/torch/ops/layer_norm.h
+index cb28b93afc875aa44df59d2355a19925afa1ec98..246254a1851ea948f8648c01cbbcdaae0470e9c3 100644
+--- a/src/linked/torch/ops/layer_norm.h
++++ b/src/linked/torch/ops/layer_norm.h
+@@ -5,7 +5,7 @@
+ #include <vector>
+
+ #include "base/layer_norm.h"
+-#include "torch/tensor_.h"
++#include "tensor.h"
+
+ namespace infini::ops::linked::torch {
+
+@@ -30,32 +30,7 @@ class TorchLayerNorm : public ::infini::ops::LayerNorm {
+
+   void operator()(const Tensor input, const Tensor weight,
+                   const std::optional<Tensor> bias, float eps,
+-                  Tensor out) const override {
+-    const typename Backend::StreamGuard stream_guard{
+-        Backend::GetStreamFromExternal(stream_, device_index_)};
+-    auto at_input = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(input.data()), input_shape_, input_strides_,
+-        input_type_, device_index_);
+-    auto at_out = ToAtenTensor<Backend::kDeviceType>(
+-        out.data(), out_shape_, out_strides_, out_type_, device_index_);
+-    auto at_weight = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(weight.data()), weight_shape_, weight_strides_,
+-        weight_type_, device_index_);
+-    c10::optional<at::Tensor> at_bias;
+-    if (bias.has_value()) {
+-      at_bias = c10::optional<at::Tensor>{ToAtenTensor<Backend::kDeviceType>(
+-          const_cast<void*>(bias->data()), bias->shape(), bias->strides(),
+-          bias->dtype(), device_index_)};
+-    }
+-
+-    // Inference LayerNorm: only the normalized output is
+-    // needed; the mean and rstd outputs are discarded.
+-    std::vector<int64_t> normalized_shape{at_input.sizes().back()};
+-    auto result =
+-        at::native_layer_norm(at_input, at::IntArrayRef(normalized_shape),
+-                              at_weight, at_bias, static_cast<double>(eps));
+-    at_out.copy_(std::get<0>(result));
+-  }
++                  Tensor out) const override;
+
+  private:
+   Tensor::Shape input_shape_;
+diff --git a/src/linked/torch/ops/layer_norm_impl.h b/src/linked/torch/ops/layer_norm_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..27eddbd686f5ea27b3decdc2b5556b94119e3308
+--- /dev/null
++++ b/src/linked/torch/ops/layer_norm_impl.h
+@@ -0,0 +1,42 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_LAYER_NORM_IMPL_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_LAYER_NORM_IMPL_H_
++
++#include "linked/torch/ops/layer_norm.h"
++#include "torch/tensor_.h"
++#include <ATen/ops/native_layer_norm.h>
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++void TorchLayerNorm<Backend>::operator()(const Tensor input, const Tensor weight,
++                  const std::optional<Tensor> bias, float eps,
++                  Tensor out) const {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_input = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(input.data()), input_shape_, input_strides_,
++        input_type_, device_index_);
++    auto at_out = ToAtenTensor<Backend::kDeviceType>(
++        out.data(), out_shape_, out_strides_, out_type_, device_index_);
++    auto at_weight = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(weight.data()), weight_shape_, weight_strides_,
++        weight_type_, device_index_);
++    c10::optional<at::Tensor> at_bias;
++    if (bias.has_value()) {
++      at_bias = c10::optional<at::Tensor>{ToAtenTensor<Backend::kDeviceType>(
++          const_cast<void*>(bias->data()), bias->shape(), bias->strides(),
++          bias->dtype(), device_index_)};
++    }
++
++    // Inference LayerNorm: only the normalized output is
++    // needed; the mean and rstd outputs are discarded.
++    std::vector<int64_t> normalized_shape{at_input.sizes().back()};
++    auto result =
++        at::native_layer_norm(at_input, at::IntArrayRef(normalized_shape),
++                              at_weight, at_bias, static_cast<double>(eps));
++    at_out.copy_(std::get<0>(result));
++  }
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_LAYER_NORM_IMPL_H_
+diff --git a/src/linked/torch/ops/moe_align_block_size.h b/src/linked/torch/ops/moe_align_block_size.h
+index f6e705f0ae8dcc0514413f6e820d0c41f7657816..82ec7af399d9738e142b58b18d51a6892770af83 100644
+--- a/src/linked/torch/ops/moe_align_block_size.h
++++ b/src/linked/torch/ops/moe_align_block_size.h
+@@ -4,7 +4,7 @@
+ #include <optional>
+
+ #include "base/moe_align_block_size.h"
+-#include "torch/tensor_.h"
++#include "tensor.h"
+
+ namespace infini::ops::linked::torch {
+
+@@ -27,39 +27,7 @@ class TorchMoeAlignBlockSize : public ::infini::ops::MoeAlignBlockSize {
+   void Run(const Tensor topk_ids, const std::optional<Tensor> expert_map,
+            const int64_t num_experts, const int64_t block_size,
+            Tensor sorted_token_ids, Tensor experts_ids,
+-           Tensor num_tokens_post_pad) const override {
+-    const typename Backend::StreamGuard stream_guard{
+-        Backend::GetStreamFromExternal(stream_, device_index_)};
+-
+-    auto at_topk_ids = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(topk_ids.data()), topk_ids_metadata_.shape(),
+-        topk_ids_metadata_.strides(), topk_ids_metadata_.dtype(),
+-        device_index_);
+-    auto at_sorted_token_ids = ToAtenTensor<Backend::kDeviceType>(
+-        sorted_token_ids.data(), sorted_token_ids_metadata_.shape(),
+-        sorted_token_ids_metadata_.strides(),
+-        sorted_token_ids_metadata_.dtype(), device_index_);
+-    auto at_experts_ids = ToAtenTensor<Backend::kDeviceType>(
+-        experts_ids.data(), experts_ids_metadata_.shape(),
+-        experts_ids_metadata_.strides(), experts_ids_metadata_.dtype(),
+-        device_index_);
+-    auto at_num_tokens_post_pad = ToAtenTensor<Backend::kDeviceType>(
+-        num_tokens_post_pad.data(), num_tokens_post_pad_metadata_.shape(),
+-        num_tokens_post_pad_metadata_.strides(),
+-        num_tokens_post_pad_metadata_.dtype(), device_index_);
+-    std::optional<at::Tensor> at_expert_map;
+-    if (expert_map.has_value()) {
+-      at_expert_map.emplace(ToAtenTensor<Backend::kDeviceType>(
+-          const_cast<void*>(expert_map->data()), expert_map_metadata_->shape(),
+-          expert_map_metadata_->strides(), expert_map_metadata_->dtype(),
+-          device_index_));
+-    }
+-
+-    Backend::Call(std::move(at_topk_ids), static_cast<int64_t>(num_experts_),
+-                  static_cast<int64_t>(block_size_),
+-                  std::move(at_sorted_token_ids), std::move(at_experts_ids),
+-                  std::move(at_num_tokens_post_pad), std::move(at_expert_map));
+-  }
++           Tensor num_tokens_post_pad) const override;
+
+  private:
+   int device_index_{0};
+diff --git a/src/linked/torch/ops/moe_align_block_size_impl.h b/src/linked/torch/ops/moe_align_block_size_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8adc9fed83fff734bd9b6e2a25b7a03fbb0a9251
+--- /dev/null
++++ b/src/linked/torch/ops/moe_align_block_size_impl.h
+@@ -0,0 +1,49 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_MOE_ALIGN_BLOCK_SIZE_IMPL_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_MOE_ALIGN_BLOCK_SIZE_IMPL_H_
++
++#include "linked/torch/ops/moe_align_block_size.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++void TorchMoeAlignBlockSize<Backend>::Run(const Tensor topk_ids, const std::optional<Tensor> expert_map,
++           const int64_t num_experts, const int64_t block_size,
++           Tensor sorted_token_ids, Tensor experts_ids,
++           Tensor num_tokens_post_pad) const {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++
++    auto at_topk_ids = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(topk_ids.data()), topk_ids_metadata_.shape(),
++        topk_ids_metadata_.strides(), topk_ids_metadata_.dtype(),
++        device_index_);
++    auto at_sorted_token_ids = ToAtenTensor<Backend::kDeviceType>(
++        sorted_token_ids.data(), sorted_token_ids_metadata_.shape(),
++        sorted_token_ids_metadata_.strides(),
++        sorted_token_ids_metadata_.dtype(), device_index_);
++    auto at_experts_ids = ToAtenTensor<Backend::kDeviceType>(
++        experts_ids.data(), experts_ids_metadata_.shape(),
++        experts_ids_metadata_.strides(), experts_ids_metadata_.dtype(),
++        device_index_);
++    auto at_num_tokens_post_pad = ToAtenTensor<Backend::kDeviceType>(
++        num_tokens_post_pad.data(), num_tokens_post_pad_metadata_.shape(),
++        num_tokens_post_pad_metadata_.strides(),
++        num_tokens_post_pad_metadata_.dtype(), device_index_);
++    std::optional<at::Tensor> at_expert_map;
++    if (expert_map.has_value()) {
++      at_expert_map.emplace(ToAtenTensor<Backend::kDeviceType>(
++          const_cast<void*>(expert_map->data()), expert_map_metadata_->shape(),
++          expert_map_metadata_->strides(), expert_map_metadata_->dtype(),
++          device_index_));
++    }
++
++    Backend::Call(std::move(at_topk_ids), static_cast<int64_t>(num_experts_),
++                  static_cast<int64_t>(block_size_),
++                  std::move(at_sorted_token_ids), std::move(at_experts_ids),
++                  std::move(at_num_tokens_post_pad), std::move(at_expert_map));
++  }
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_MOE_ALIGN_BLOCK_SIZE_IMPL_H_
+diff --git a/src/linked/torch/ops/pad.h b/src/linked/torch/ops/pad.h
+index 893eb06d6e3436be671f86220c900d830695de44..7960ad6176fa8afe68b18fafb373c17db36e38d9 100644
+--- a/src/linked/torch/ops/pad.h
++++ b/src/linked/torch/ops/pad.h
+@@ -5,7 +5,7 @@
+ #include <vector>
+
+ #include "base/pad.h"
+-#include "torch/tensor_.h"
++#include "tensor.h"
+
+ namespace infini::ops::linked::torch {
+
+@@ -28,18 +28,7 @@ class TorchPad : public ::infini::ops::Pad {
+
+   void operator()(const Tensor input, const std::vector<int64_t> pad,
+                   const std::string mode, const std::optional<double> value,
+-                  Tensor out) const override {
+-    const typename Backend::StreamGuard stream_guard{
+-        Backend::GetStreamFromExternal(stream_, device_index_)};
+-    auto at_input = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(input.data()), input_shape_, input_strides_,
+-        input_type_, device_index_);
+-    auto at_out = ToAtenTensor<Backend::kDeviceType>(
+-        out.data(), out_shape_, out_strides_, out_type_, device_index_);
+-    (void)mode;
+-    Backend::Call(std::move(at_out), std::move(at_input), pad,
+-                  value.value_or(0.0));
+-  }
++                  Tensor out) const override;
+
+  private:
+   Tensor::Shape input_shape_;
+diff --git a/src/linked/torch/ops/pad_impl.h b/src/linked/torch/ops/pad_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c45efbb3517dfe938776a8f0424a93f90026878d
+--- /dev/null
++++ b/src/linked/torch/ops/pad_impl.h
+@@ -0,0 +1,27 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_PAD_IMPL_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_PAD_IMPL_H_
++
++#include "linked/torch/ops/pad.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++void TorchPad<Backend>::operator()(const Tensor input, const std::vector<int64_t> pad,
++                  const std::string mode, const std::optional<double> value,
++                  Tensor out) const {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_input = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(input.data()), input_shape_, input_strides_,
++        input_type_, device_index_);
++    auto at_out = ToAtenTensor<Backend::kDeviceType>(
++        out.data(), out_shape_, out_strides_, out_type_, device_index_);
++    (void)mode;
++    Backend::Call(std::move(at_out), std::move(at_input), pad,
++                  value.value_or(0.0));
++  }
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_PAD_IMPL_H_
+diff --git a/src/linked/torch/ops/quick_gelu.h b/src/linked/torch/ops/quick_gelu.h
+index 6a2c88de359d8e1b9b568ccba79c4e337d59c9e6..b20df03fa00c15cf62247f96527878294ab302fa 100644
+--- a/src/linked/torch/ops/quick_gelu.h
++++ b/src/linked/torch/ops/quick_gelu.h
+@@ -2,7 +2,7 @@
+ #define INFINI_OPS_LINKED_TORCH_OPS_QUICK_GELU_H_
+
+ #include "base/quick_gelu.h"
+-#include "torch/tensor_.h"
++#include "tensor.h"
+
+ namespace infini::ops::linked::torch {
+
+@@ -21,26 +21,7 @@ class TorchQuickGelu : public ::infini::ops::QuickGelu {
+
+   using ::infini::ops::QuickGelu::operator();
+
+-  void operator()(const Tensor input, Tensor out) const override {
+-    const typename Backend::StreamGuard stream_guard{
+-        Backend::GetStreamFromExternal(stream_, device_index_)};
+-    auto at_input = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(input.data()), input_shape_, input_strides_,
+-        input_type_, device_index_);
+-    auto at_out = ToAtenTensor<Backend::kDeviceType>(
+-        out.data(), out_shape_, out_strides_, out_type_, device_index_);
+-
+-    auto backend_input =
+-        is_input_contiguous_ ? at_input : at_input.contiguous();
+-    auto backend_out = is_out_contiguous_
+-                           ? at_out
+-                           : at::empty(at_out.sizes(), at_out.options());
+-
+-    Backend::Call(backend_out, backend_input);
+-    if (!is_out_contiguous_) {
+-      at_out.copy_(backend_out);
+-    }
+-  }
++  void operator()(const Tensor input, Tensor out) const override;
+
+  private:
+   Tensor::Shape input_shape_;
+diff --git a/src/linked/torch/ops/quick_gelu_impl.h b/src/linked/torch/ops/quick_gelu_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..eec00091a119b0fb88b3961b6961c2a54ff4c572
+--- /dev/null
++++ b/src/linked/torch/ops/quick_gelu_impl.h
+@@ -0,0 +1,33 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_QUICK_GELU_IMPL_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_QUICK_GELU_IMPL_H_
++
++#include "linked/torch/ops/quick_gelu.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++void TorchQuickGelu<Backend>::operator()(const Tensor input, Tensor out) const {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_input = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(input.data()), input_shape_, input_strides_,
++        input_type_, device_index_);
++    auto at_out = ToAtenTensor<Backend::kDeviceType>(
++        out.data(), out_shape_, out_strides_, out_type_, device_index_);
++
++    auto backend_input =
++        is_input_contiguous_ ? at_input : at_input.contiguous();
++    auto backend_out = is_out_contiguous_
++                           ? at_out
++                           : at::empty(at_out.sizes(), at_out.options());
++
++    Backend::Call(backend_out, backend_input);
++    if (!is_out_contiguous_) {
++      at_out.copy_(backend_out);
++    }
++  }
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_QUICK_GELU_IMPL_H_
+diff --git a/src/linked/torch/ops/rms_norm.h b/src/linked/torch/ops/rms_norm.h
+index 2ae538c83685780fc573b72dae6376ed3620c38b..ca2cf7c12bb4f39588807ee58ce6b703fa749641 100644
+--- a/src/linked/torch/ops/rms_norm.h
++++ b/src/linked/torch/ops/rms_norm.h
+@@ -2,7 +2,7 @@
+ #define INFINI_OPS_LINKED_TORCH_OPS_RMS_NORM_H_
+
+ #include "base/rms_norm.h"
+-#include "torch/tensor_.h"
++#include "tensor.h"
+
+ namespace infini::ops::linked::torch {
+
+@@ -27,32 +27,7 @@ class TorchRmsNorm : public ::infini::ops::RmsNorm {
+   using ::infini::ops::RmsNorm::operator();
+
+   void operator()(const Tensor input, const Tensor weight, float eps,
+-                  Tensor out) const override {
+-    const typename Backend::StreamGuard stream_guard{
+-        Backend::GetStreamFromExternal(stream_, device_index_)};
+-    auto at_input = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(input.data()), input_shape_, input_strides_,
+-        input_type_, device_index_);
+-    auto at_weight = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(weight.data()), weight_shape_, weight_strides_,
+-        weight_type_, device_index_);
+-    auto at_out = ToAtenTensor<Backend::kDeviceType>(
+-        out.data(), out_shape_, out_strides_, out_type_, device_index_);
+-
+-    auto backend_input =
+-        is_input_contiguous_ ? at_input : at_input.contiguous();
+-    auto backend_weight =
+-        is_weight_contiguous_ ? at_weight : at_weight.contiguous();
+-    auto backend_out = is_out_contiguous_
+-                           ? at_out
+-                           : at::empty(at_out.sizes(), at_out.options());
+-
+-    Backend::Call(backend_out, backend_input, backend_weight,
+-                  static_cast<double>(eps));
+-    if (!is_out_contiguous_) {
+-      at_out.copy_(backend_out);
+-    }
+-  }
++                  Tensor out) const override;
+
+  private:
+   Tensor::Shape weight_shape_;
+diff --git a/src/linked/torch/ops/rms_norm_impl.h b/src/linked/torch/ops/rms_norm_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..49a7a79d4d37eda72c0a3ae5328211e394d01e02
+--- /dev/null
++++ b/src/linked/torch/ops/rms_norm_impl.h
+@@ -0,0 +1,40 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_RMS_NORM_IMPL_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_RMS_NORM_IMPL_H_
++
++#include "linked/torch/ops/rms_norm.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++void TorchRmsNorm<Backend>::operator()(const Tensor input, const Tensor weight, float eps,
++                  Tensor out) const {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_input = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(input.data()), input_shape_, input_strides_,
++        input_type_, device_index_);
++    auto at_weight = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(weight.data()), weight_shape_, weight_strides_,
++        weight_type_, device_index_);
++    auto at_out = ToAtenTensor<Backend::kDeviceType>(
++        out.data(), out_shape_, out_strides_, out_type_, device_index_);
++
++    auto backend_input =
++        is_input_contiguous_ ? at_input : at_input.contiguous();
++    auto backend_weight =
++        is_weight_contiguous_ ? at_weight : at_weight.contiguous();
++    auto backend_out = is_out_contiguous_
++                           ? at_out
++                           : at::empty(at_out.sizes(), at_out.options());
++
++    Backend::Call(backend_out, backend_input, backend_weight,
++                  static_cast<double>(eps));
++    if (!is_out_contiguous_) {
++      at_out.copy_(backend_out);
++    }
++  }
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_RMS_NORM_IMPL_H_
+diff --git a/src/linked/torch/ops/silu_and_mul.h b/src/linked/torch/ops/silu_and_mul.h
+index 10d96a4b4ee2ae5707682f2bd2d1a320d68cfaa6..d80d1668546ddcf57c5c1e26b7e51eedc760e1df 100644
+--- a/src/linked/torch/ops/silu_and_mul.h
++++ b/src/linked/torch/ops/silu_and_mul.h
+@@ -2,7 +2,7 @@
+ #define INFINI_OPS_LINKED_TORCH_OPS_SILU_AND_MUL_H_
+
+ #include "base/silu_and_mul.h"
+-#include "torch/tensor_.h"
++#include "tensor.h"
+
+ namespace infini::ops::linked::torch {
+
+@@ -15,26 +15,7 @@ class TorchSiluAndMul : public ::infini::ops::SiluAndMul {
+
+   using ::infini::ops::SiluAndMul::operator();
+
+-  void operator()(const Tensor input, Tensor out) const override {
+-    const typename Backend::StreamGuard stream_guard{
+-        Backend::GetStreamFromExternal(stream_, device_index_)};
+-    auto at_input = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(input.data()), input_shape_, input_strides_,
+-        input_type_, device_index_);
+-    auto at_out = ToAtenTensor<Backend::kDeviceType>(
+-        out.data(), out_shape_, out_strides_, out_type_, device_index_);
+-
+-    auto backend_input =
+-        is_input_contiguous_ ? at_input : at_input.contiguous();
+-    auto backend_out = is_out_contiguous_
+-                           ? at_out
+-                           : at::empty(at_out.sizes(), at_out.options());
+-
+-    Backend::Call(backend_out, backend_input);
+-    if (!is_out_contiguous_) {
+-      at_out.copy_(backend_out);
+-    }
+-  }
++  void operator()(const Tensor input, Tensor out) const override;
+
+  private:
+   int device_index_{0};
+diff --git a/src/linked/torch/ops/silu_and_mul_impl.h b/src/linked/torch/ops/silu_and_mul_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0595d9befdeb0caf5729fff8441f5cd8a7b0a26b
+--- /dev/null
++++ b/src/linked/torch/ops/silu_and_mul_impl.h
+@@ -0,0 +1,33 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_SILU_AND_MUL_IMPL_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_SILU_AND_MUL_IMPL_H_
++
++#include "linked/torch/ops/silu_and_mul.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++void TorchSiluAndMul<Backend>::operator()(const Tensor input, Tensor out) const {
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_input = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(input.data()), input_shape_, input_strides_,
++        input_type_, device_index_);
++    auto at_out = ToAtenTensor<Backend::kDeviceType>(
++        out.data(), out_shape_, out_strides_, out_type_, device_index_);
++
++    auto backend_input =
++        is_input_contiguous_ ? at_input : at_input.contiguous();
++    auto backend_out = is_out_contiguous_
++                           ? at_out
++                           : at::empty(at_out.sizes(), at_out.options());
++
++    Backend::Call(backend_out, backend_input);
++    if (!is_out_contiguous_) {
++      at_out.copy_(backend_out);
++    }
++  }
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_SILU_AND_MUL_IMPL_H_
+diff --git a/src/linked/torch/ops/topk_sigmoid.h b/src/linked/torch/ops/topk_sigmoid.h
+index c7f0e72195d253360d69319f7b1e685eddc4f583..3e81d8620056d65766667e34af60b382b13c8b2e 100644
+--- a/src/linked/torch/ops/topk_sigmoid.h
++++ b/src/linked/torch/ops/topk_sigmoid.h
+@@ -5,7 +5,7 @@
+ #include <utility>
+
+ #include "base/topk_sigmoid.h"
+-#include "torch/tensor_.h"
++#include "tensor.h"
+
+ namespace infini::ops::linked::torch {
+
+@@ -20,43 +20,7 @@ class TorchTopkSigmoid : public ::infini::ops::TopkSigmoid {
+                   std::optional<Tensor> e_score_correction_bias,
+                   std::optional<Tensor> is_padding, const bool renormalize,
+                   const double routed_scaling_factor, Tensor topk_weights,
+-                  Tensor topk_ids, Tensor token_expert_indices) const override {
+-    ValidateCallMetadata(gating_output, e_score_correction_bias, is_padding,
+-                         renormalize, routed_scaling_factor, topk_weights,
+-                         topk_ids, token_expert_indices);
+-    Backend::Validate(is_padding.has_value(), routed_scaling_factor);
+-    if (num_tokens_ == 0) {
+-      return;
+-    }
+-
+-    const typename Backend::StreamGuard stream_guard{
+-        Backend::GetStreamFromExternal(stream_, device_index_)};
+-    auto at_gating_output = ToAtenTensor<Backend::kDeviceType>(
+-        const_cast<void*>(gating_output.data()), gating_output.shape(),
+-        gating_output.strides(), gating_output.dtype(), device_index_);
+-    std::optional<at::Tensor> at_e_score_correction_bias;
+-    if (e_score_correction_bias.has_value()) {
+-      at_e_score_correction_bias.emplace(ToAtenTensor<Backend::kDeviceType>(
+-          const_cast<void*>(e_score_correction_bias->data()),
+-          e_score_correction_bias->shape(), e_score_correction_bias->strides(),
+-          e_score_correction_bias->dtype(), device_index_));
+-    }
+-    auto at_topk_weights = ToAtenTensor<Backend::kDeviceType>(
+-        topk_weights.data(), topk_weights.shape(), topk_weights.strides(),
+-        topk_weights.dtype(), device_index_);
+-    auto at_topk_ids = ToAtenTensor<Backend::kDeviceType>(
+-        topk_ids.data(), topk_ids.shape(), topk_ids.strides(), topk_ids.dtype(),
+-        device_index_);
+-    auto at_token_expert_indices = ToAtenTensor<Backend::kDeviceType>(
+-        token_expert_indices.data(), token_expert_indices.shape(),
+-        token_expert_indices.strides(), token_expert_indices.dtype(),
+-        device_index_);
+-
+-    Backend::Call(std::move(at_topk_weights), std::move(at_topk_ids),
+-                  std::move(at_token_expert_indices),
+-                  std::move(at_gating_output), renormalize,
+-                  std::move(at_e_score_correction_bias));
+-  }
++                  Tensor topk_ids, Tensor token_expert_indices) const override;
+ };
+
+ }  // namespace infini::ops::linked::torch
+diff --git a/src/linked/torch/ops/topk_sigmoid_impl.h b/src/linked/torch/ops/topk_sigmoid_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..23c82059e43986de3a30e243c3c5fc279c576d5a
+--- /dev/null
++++ b/src/linked/torch/ops/topk_sigmoid_impl.h
+@@ -0,0 +1,54 @@
++#ifndef INFINI_OPS_LINKED_TORCH_OPS_TOPK_SIGMOID_IMPL_H_
++#define INFINI_OPS_LINKED_TORCH_OPS_TOPK_SIGMOID_IMPL_H_
++
++#include "linked/torch/ops/topk_sigmoid.h"
++#include "torch/tensor_.h"
++
++namespace infini::ops::linked::torch {
++
++template <typename Backend>
++void TorchTopkSigmoid<Backend>::operator()(const Tensor gating_output,
++                  std::optional<Tensor> e_score_correction_bias,
++                  std::optional<Tensor> is_padding, const bool renormalize,
++                  const double routed_scaling_factor, Tensor topk_weights,
++                  Tensor topk_ids, Tensor token_expert_indices) const {
++    ValidateCallMetadata(gating_output, e_score_correction_bias, is_padding,
++                         renormalize, routed_scaling_factor, topk_weights,
++                         topk_ids, token_expert_indices);
++    Backend::Validate(is_padding.has_value(), routed_scaling_factor);
++    if (num_tokens_ == 0) {
++      return;
++    }
++
++    const typename Backend::StreamGuard stream_guard{
++        Backend::GetStreamFromExternal(stream_, device_index_)};
++    auto at_gating_output = ToAtenTensor<Backend::kDeviceType>(
++        const_cast<void*>(gating_output.data()), gating_output.shape(),
++        gating_output.strides(), gating_output.dtype(), device_index_);
++    std::optional<at::Tensor> at_e_score_correction_bias;
++    if (e_score_correction_bias.has_value()) {
++      at_e_score_correction_bias.emplace(ToAtenTensor<Backend::kDeviceType>(
++          const_cast<void*>(e_score_correction_bias->data()),
++          e_score_correction_bias->shape(), e_score_correction_bias->strides(),
++          e_score_correction_bias->dtype(), device_index_));
++    }
++    auto at_topk_weights = ToAtenTensor<Backend::kDeviceType>(
++        topk_weights.data(), topk_weights.shape(), topk_weights.strides(),
++        topk_weights.dtype(), device_index_);
++    auto at_topk_ids = ToAtenTensor<Backend::kDeviceType>(
++        topk_ids.data(), topk_ids.shape(), topk_ids.strides(), topk_ids.dtype(),
++        device_index_);
++    auto at_token_expert_indices = ToAtenTensor<Backend::kDeviceType>(
++        token_expert_indices.data(), token_expert_indices.shape(),
++        token_expert_indices.strides(), token_expert_indices.dtype(),
++        device_index_);
++
++    Backend::Call(std::move(at_topk_weights), std::move(at_topk_ids),
++                  std::move(at_token_expert_indices),
++                  std::move(at_gating_output), renormalize,
++                  std::move(at_e_score_correction_bias));
++  }
++
++}  // namespace infini::ops::linked::torch
++
++#endif  // INFINI_OPS_LINKED_TORCH_OPS_TOPK_SIGMOID_IMPL_H_
+diff --git a/src/linked/torch/thead/ops/rms_norm/vllm.cc b/src/linked/torch/thead/ops/rms_norm/vllm.cc
+index dcc1ab49c565fd8bc5b5cc6533d9611e1c9ab77b..e3827a2c83193d8ff3b707d05361031eca2b2da4 100644
+--- a/src/linked/torch/thead/ops/rms_norm/vllm.cc
++++ b/src/linked/torch/thead/ops/rms_norm/vllm.cc
+@@ -1,3 +1,4 @@
++#include "linked/torch/ops/rms_norm_impl.h"
+ #include "linked/torch/thead/ops/rms_norm/vllm.h"
+
+ // T-Head PPU vLLM `_C` exports this global C++ symbol.
+diff --git a/src/linked/torch/thead/ops/silu_and_mul/vllm.cc b/src/linked/torch/thead/ops/silu_and_mul/vllm.cc
+index 4526d4d1187c6b7ead130128ec53f1445546588b..579017b14f4b44a0a986ab6e2d874996b3220c0d 100644
+--- a/src/linked/torch/thead/ops/silu_and_mul/vllm.cc
++++ b/src/linked/torch/thead/ops/silu_and_mul/vllm.cc
+@@ -1,3 +1,4 @@
++#include "linked/torch/ops/silu_and_mul_impl.h"
+ #include "linked/torch/thead/ops/silu_and_mul/vllm.h"
+
+ // T-Head PPU vLLM `_C` exports this global C++ symbol.

@@ -16,7 +16,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from infinilm.routing.bounded_hash.cache_router_v3 import Router
+from infinilm.routing.bounded_hash.cache_router_v3 import Router as V3Router
+from infinilm.routing.bounded_hash.round_robin_router import Router as RoundRobinRouter
 from infinilm.server.bounded_hash_config import GatewayConfig
 
 logger = logging.getLogger(__name__)
@@ -82,32 +83,49 @@ class Gateway:
 
     def __init__(self, config):
         self.config = config
-        self.router = Router(
-            config.urls, phase_model=config.phase_model,
-            max_inflight=config.max_inflight, kv_tokens=config.kv_tokens,
-            page_size=config.page_size, skew=config.skew,
-            virtual_nodes=config.virtual_nodes, cache_ttl_s=config.cache_ttl_s,
-            queue_timeout_s=config.queue_timeout_s, warm_wait_ms=config.warm_wait_ms,
-        )
+        if config.routing_policy == "bounded_hash_v3":
+            self.router = V3Router(
+                config.urls, phase_model=config.phase_model,
+                max_inflight=config.max_inflight, kv_tokens=config.kv_tokens,
+                page_size=config.page_size, skew=config.skew,
+                virtual_nodes=config.virtual_nodes, cache_ttl_s=config.cache_ttl_s,
+                queue_timeout_s=config.queue_timeout_s,
+                warm_wait_ms=config.warm_wait_ms,
+            )
+        else:
+            self.router = RoundRobinRouter(
+                config.urls, max_inflight=config.max_inflight,
+                kv_tokens=config.kv_tokens, page_size=config.page_size,
+                queue_timeout_s=config.queue_timeout_s,
+                expected_prompt_tokens=config.expected_prompt_tokens,
+                expected_output_tokens=config.expected_output_tokens,
+                expected_shared_tokens=config.expected_shared_tokens,
+            )
         self.client = None
         self.quarantined = {}
         self.peak_active = [0] * len(config.urls)
         self.peak_reserved = [0] * len(config.urls)
 
-    async def prepare(self, body):
-        """Obtain token contracts from the replicas' existing tokenizers."""
-        async def contract(worker):
-            response = await self.client.post(
-                self.config.urls[worker] + "/internal/bounded-hash/contract",
-                headers={"Authorization": "Bearer " + self.config.keys[worker]},
-                json={"request": body, "prefix_tokens": self.config.prefix_tokens},
-            )
-            response.raise_for_status()
-            result = response.json()
-            self.config.validate_contract(result)
-            return result
+    async def contract(self, worker, body):
+        """Ask one selected backend for authoritative token/model metadata."""
+        response = await self.client.post(
+            self.config.urls[worker] + "/internal/bounded-hash/contract",
+            headers={"Authorization": "Bearer " + self.config.keys[worker]},
+            json={"request": body, "prefix_tokens": self.config.prefix_tokens},
+        )
+        response.raise_for_status()
+        result = response.json()
+        self.config.validate_contract(result)
+        return result
 
-        contracts = await asyncio.gather(*(contract(i) for i in range(len(self.config.urls))))
+    async def prepare(self, body):
+        """Obtain V3's unchanged eight-replica token contracts."""
+        if self.config.routing_policy != "bounded_hash_v3":
+            raise RuntimeError("Eight-replica prepare is V3-only.")
+
+        contracts = await asyncio.gather(*(
+            self.contract(i, body) for i in range(len(self.config.urls))
+        ))
         reference = contracts[0]
         equal_fields = ("identity", "token_digest", "prompt_tokens", "output_tokens", "shared_tokens", "prefix_digest")
         for worker, current in enumerate(contracts):
@@ -129,7 +147,7 @@ class Gateway:
             raise ValueError("The complete input and maximum output exceed replica KV capacity.")
         return item, contracts
 
-    async def generate(self, body, item, contracts):
+    async def generate(self, body, item=None, contracts=None, client_request_id=None):
         """Attempt generation once and release its lease on every exit."""
         lease = None
         success = False
@@ -139,7 +157,29 @@ class Gateway:
         finish = None
         queued_at = time.monotonic()
         try:
-            lease = await self.router.acquire(item)
+            if self.config.routing_policy == "bounded_hash_v3":
+                if item is None or contracts is None:
+                    raise RuntimeError("V3 generation requires prepared pool contracts.")
+                lease = await self.router.acquire(item)
+                backend = contracts[lease.worker]
+            else:
+                if item is not None or contracts is not None:
+                    raise RuntimeError("RR does not accept V3 prepared contracts.")
+                provisional = {
+                    "id": uuid.uuid4().hex,
+                    "client_request_id": client_request_id,
+                }
+                lease = await self.router.acquire(provisional)
+                backend = await self.contract(lease.worker, body)
+                self.router.bind_contract(lease, backend)
+                item = {
+                    "id": provisional["id"],
+                    "key": backend.get("prefix_digest") or backend["token_digest"],
+                    **{field: backend[field] for field in (
+                        "prompt_tokens", "output_tokens", "shared_tokens", "prefix_digest"
+                    )},
+                    "client_request_id": client_request_id,
+                }
             admitted_at = time.monotonic()
             snapshot = self.router.snapshot()
             self.peak_active = [max(old, current) for old, current in zip(
@@ -148,7 +188,6 @@ class Gateway:
             self.peak_reserved = [max(old, current) for old, current in zip(
                 self.peak_reserved, snapshot["kv_reserved_tokens"]
             )]
-            backend = contracts[lease.worker]
             if lease.backend_instance_id != backend["backend_instance_id"]:
                 raise ValueError("Backend instance changed while awaiting admission.")
             headers = {
@@ -201,7 +240,11 @@ class Gateway:
                     "peak_reserved_tokens": list(self.peak_reserved),
                     "peak_inflight": list(self.peak_active),
                     "route": dict(lease.route),
-                    "client_request_id": item.get("client_request_id"),
+                    "client_request_id": client_request_id or item.get("client_request_id"),
+                    "routing_policy": self.config.routing_policy,
+                    "contract_rpc_count": (
+                        len(contracts) if contracts is not None else 1
+                    ),
                 },
             }
         finally:
@@ -209,8 +252,8 @@ class Gateway:
                 if attempted and not success:
                     # An interrupted POST may still execute. Restore admission only
                     # after a new backend instance proves the old work has gone.
-                    self.quarantined[lease.worker] = contracts[lease.worker]["backend_instance_id"]
-                    self.router.workers[lease.worker].healthy = False
+                    self.quarantined[lease.worker] = backend["backend_instance_id"]
+                    self.router.mark_unhealthy(lease.worker)
                 self.router.release(lease, success, usage)
 
 
@@ -242,8 +285,9 @@ def create_app(config):
             "router": gateway.router.snapshot(),
             "peak_inflight": list(gateway.peak_active),
             "peak_reserved_tokens": list(gateway.peak_reserved),
-            "cache_observations": copy.deepcopy(gateway.router.cache),
+            "cache_observations": copy.deepcopy(getattr(gateway.router, "cache", [])),
             "healthy": [worker.healthy for worker in gateway.router.workers],
+            "routing_policy": config.routing_policy,
         }
 
     @app.post("/v1/chat/completions")
@@ -251,8 +295,12 @@ def create_app(config):
         try:
             original = await request.json()
             body = validate_request(original)
-            item, contracts = await gateway.prepare(body)
-            item["client_request_id"] = request.headers.get("X-Request-ID")
+            client_request_id = request.headers.get("X-Request-ID")
+            if config.routing_policy == "bounded_hash_v3":
+                item, contracts = await gateway.prepare(body)
+                item["client_request_id"] = client_request_id
+            else:
+                item = contracts = None
         except (ValueError, KeyError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except httpx.HTTPStatusError as exc:
@@ -264,7 +312,8 @@ def create_app(config):
 
         async def streaming():
             try:
-                async with contextlib.aclosing(gateway.generate(body, item, contracts)) as events:
+                async with contextlib.aclosing(gateway.generate(
+                        body, item, contracts, client_request_id)) as events:
                     async for event in events:
                         event.pop("x_infinilm", None)
                         if not event.get("choices") and not event.get("usage") and not event.get("x_admission"):
@@ -290,7 +339,8 @@ def create_app(config):
             finish = None
             token_ids = {}
             admission = None
-            async with contextlib.aclosing(gateway.generate(body, item, contracts)) as events:
+            async with contextlib.aclosing(gateway.generate(
+                    body, item, contracts, client_request_id)) as events:
                 async for event in events:
                     if event.get("id"):
                         result = event
